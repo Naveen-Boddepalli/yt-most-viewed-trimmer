@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+downloads/
+trimmed_clips/
+temp_workspace/
+*.mp4
+*.webm
+*.mkv
+*.zip
+.DS_Store
+.bin/
