@@ -22,6 +22,7 @@ from utils import (
     format_bytes,
     strip_ansi,
     get_yt_cookies_file,
+    sanitize_cookie_content,
 )
 from yt_processor import (
     HighlightSegment,
@@ -339,6 +340,31 @@ with btn_col:
     analyze_clicked = st.button("🔍 Load & Extract Timestamps", type="primary", **STRETCH_WIDTH)
 with demo_col:
     demo_clicked = st.button("🧪 Load Sample Heatmap Demo", **STRETCH_WIDTH)
+
+active_cookie_file = get_yt_cookies_file()
+if not active_cookie_file:
+    with st.expander("🔑 YouTube Authentication (Required for Cloud Hosting)", expanded=True):
+        st.warning(
+            "⚠️ **No YouTube cookies detected**: YouTube blocks cloud servers (Streamlit Cloud, AWS) from streaming video formats without authentication.\n\n"
+            "**To enable video trimming:**\n"
+            "1. Export your YouTube cookies using the free Chrome extension **Get cookies.txt LOCALLY**.\n"
+            "2. Paste the cookie text below and click **Save & Authenticate** (or add `YOUTUBE_COOKIES` in Streamlit Cloud Secrets)."
+        )
+        main_cookie_text = st.text_area(
+            "Paste cookies.txt content here",
+            placeholder="# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t...\t...",
+            height=110,
+            key="main_cookie_box",
+        )
+        if st.button("💾 Save & Authenticate Cookies", type="primary", key="save_main_cookie_btn"):
+            if main_cookie_text.strip():
+                sanitized = sanitize_cookie_content(main_cookie_text)
+                Path("user_cookies.txt").write_text(sanitized, encoding="utf-8")
+                st.session_state["youtube_cookies_text"] = sanitized
+                st.success("✅ Cookies saved and activated! You can now trim videos.")
+                st.rerun()
+else:
+    st.caption("✅ **YouTube Authenticated** (Cookies active on server)")
 
 
 # ------------------------------------------------------------------------------

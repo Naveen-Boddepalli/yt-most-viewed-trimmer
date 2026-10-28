@@ -7,6 +7,24 @@ from pathlib import Path
 from typing import Tuple, Optional
 
 
+def sanitize_cookie_content(content: str) -> str:
+    """Ensure the cookie content has the proper Netscape HTTP Cookie File header for yt-dlp."""
+    cleaned = content.strip().strip("\"'`")
+    lines = [l.rstrip() for l in cleaned.splitlines()]
+    while lines and not lines[0]:
+        lines.pop(0)
+    has_header = any("# Netscape HTTP Cookie File" in l for l in lines[:5])
+    if not has_header:
+        header = [
+            "# Netscape HTTP Cookie File",
+            "# https://curl.haxx.se/rfc/cookie_spec.html",
+            "# This is a generated file! Do not edit.",
+            "",
+        ]
+        lines = header + lines
+    return "\n".join(lines) + "\n"
+
+
 def get_yt_cookies_file() -> Optional[str]:
     """
     Check if YouTube cookies are available from:
@@ -19,6 +37,12 @@ def get_yt_cookies_file() -> Optional[str]:
     for fname in ["user_cookies.txt", "cookies.txt"]:
         p = Path(fname)
         if p.exists() and p.stat().st_size > 0:
+            try:
+                raw = p.read_text(encoding="utf-8")
+                sanitized = sanitize_cookie_content(raw)
+                p.write_text(sanitized, encoding="utf-8")
+            except Exception:
+                pass
             return str(p.resolve())
 
     # 2. Check Streamlit secrets (permanent cloud storage)
@@ -29,7 +53,8 @@ def get_yt_cookies_file() -> Optional[str]:
                 val = st.secrets[key]
                 if val and str(val).strip():
                     temp_cf = Path(tempfile.gettempdir()) / "st_secrets_cookies.txt"
-                    temp_cf.write_text(str(val).strip(), encoding="utf-8")
+                    sanitized = sanitize_cookie_content(str(val))
+                    temp_cf.write_text(sanitized, encoding="utf-8")
                     return str(temp_cf.resolve())
     except Exception:
         pass
@@ -40,7 +65,8 @@ def get_yt_cookies_file() -> Optional[str]:
         pasted = st.session_state.get("youtube_cookies_text")
         if pasted and str(pasted).strip():
             temp_cf = Path(tempfile.gettempdir()) / "session_cookies.txt"
-            temp_cf.write_text(str(pasted).strip(), encoding="utf-8")
+            sanitized = sanitize_cookie_content(str(pasted))
+            temp_cf.write_text(sanitized, encoding="utf-8")
             return str(temp_cf.resolve())
     except Exception:
         pass
