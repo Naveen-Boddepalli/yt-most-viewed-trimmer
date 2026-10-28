@@ -13,3 +13,5 @@ temp_workspace/
 *.zip
 .DS_Store
 .bin/
+*cookies.txt
+
