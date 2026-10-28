@@ -112,16 +112,15 @@ def download_full_video(
         "socket_timeout": 30,        # Don't hang on dropped sockets
         "http_chunk_size": 10485760, # 10 MB chunks to prevent YouTube CDN stream aborts
         "progress_hooks": [_hook],
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["visionos", "web", "mweb"],
+            }
+        },
     }
 
     if cookies_file and Path(cookies_file).exists():
         ydl_opts["cookiefile"] = str(cookies_file)
-    else:
-        ydl_opts["extractor_args"] = {
-            "youtube": {
-                "player_client": ["mweb", "ios", "android", "web"],
-            }
-        }
 
     if ffmpeg_exe:
         format_selector = (
@@ -204,16 +203,15 @@ def download_single_clip_section(
         "fragment_retries": 15,
         "socket_timeout": 30,
         "progress_hooks": [_hook],
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["visionos", "web", "mweb"],
+            }
+        },
     }
 
     if cookies_file and Path(cookies_file).exists():
         ydl_opts["cookiefile"] = str(cookies_file)
-    else:
-        ydl_opts["extractor_args"] = {
-            "youtube": {
-                "player_client": ["mweb", "ios", "android", "web"],
-            }
-        }
 
     if ffmpeg_exe:
         ydl_opts["ffmpeg_location"] = ffmpeg_exe

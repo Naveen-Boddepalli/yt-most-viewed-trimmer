@@ -47,17 +47,15 @@ def fetch_video_metadata(url: str, cookies_file: Optional[str] = None) -> Dict[s
         "skip_download": True,
         "extract_flat": False,
         "ignore_no_formats_error": True,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["visionos", "web", "mweb"],
+            }
+        },
     }
 
     if cookies_file and Path(cookies_file).exists():
         ydl_opts["cookiefile"] = str(cookies_file)
-    else:
-        # Without cookies, try mobile/web clients to help bypass datacenter IP bot detection
-        ydl_opts["extractor_args"] = {
-            "youtube": {
-                "player_client": ["mweb", "ios", "android", "web"],
-            }
-        }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
