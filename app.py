@@ -43,17 +43,34 @@ from yt_processor import (
     estimate_video_size,
     estimate_clip_size,
 )
-from video_trimmer import (
-    has_ffmpeg,
-    ensure_ffmpeg,
-    get_ffmpeg_diagnostics,
-    download_full_video,
-    download_single_clip_section,
-    download_and_trim_segments_direct,
-    trim_clip_ffmpeg,
-    trim_selected_segments,
-    create_clips_zip,
-)
+try:
+    from video_trimmer import (
+        has_ffmpeg,
+        ensure_ffmpeg,
+        get_ffmpeg_diagnostics,
+        download_full_video,
+        download_single_clip_section,
+        download_and_trim_segments_direct,
+        trim_clip_ffmpeg,
+        trim_selected_segments,
+        create_clips_zip,
+    )
+except ImportError:
+    import importlib
+    import sys
+    if "video_trimmer" in sys.modules:
+        importlib.reload(sys.modules["video_trimmer"])
+    from video_trimmer import (
+        has_ffmpeg,
+        ensure_ffmpeg,
+        get_ffmpeg_diagnostics,
+        download_full_video,
+        download_single_clip_section,
+        download_and_trim_segments_direct,
+        trim_clip_ffmpeg,
+        trim_selected_segments,
+        create_clips_zip,
+    )
 
 # Streamlit >= 1.40 compatibility: replace deprecated use_container_width=True with width="stretch"
 STRETCH_WIDTH = (
