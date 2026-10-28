@@ -1,6 +1,7 @@
 """YouTube metadata & Most-Replayed (heatmap) timestamp extraction module."""
 
 from dataclasses import dataclass, asdict
+from pathlib import Path
 from typing import List, Dict, Any, Optional
 import re
 from utils import format_timestamp
