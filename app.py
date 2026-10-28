@@ -259,6 +259,23 @@ with st.sidebar:
     )
     is_direct_stream_trim = "Direct Stream-Trim" in trim_strategy
 
+    with st.expander("🍪 YouTube Cookies / Bot Bypass", expanded=False):
+        st.caption(
+            "Cloud servers (Streamlit Cloud, AWS) can occasionally be flagged by YouTube's bot detection. "
+            "You can paste your YouTube `cookies.txt` here or add `YOUTUBE_COOKIES` in Streamlit Cloud Secrets."
+        )
+        cookie_text = st.text_area(
+            "Paste cookies.txt content",
+            value=st.session_state.get("youtube_cookies_text", ""),
+            placeholder="# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t...\t...",
+            height=120,
+            help="Export cookies from your browser using an extension like 'Get cookies.txt LOCALLY'.",
+        )
+        if cookie_text != st.session_state.get("youtube_cookies_text", ""):
+            st.session_state["youtube_cookies_text"] = cookie_text
+        if st.session_state.get("youtube_cookies_text"):
+            st.success("✅ Cookies active for this session")
+
     st.divider()
     ffmpeg_ok = has_ffmpeg()
     if ffmpeg_ok:
@@ -385,7 +402,19 @@ if analyze_clicked:
                     )
                 st.session_state["segments"] = segs
             except Exception as exc:
-                st.error(f"Failed to load YouTube video metadata: {exc}")
+                err_text = str(exc)
+                st.error(f"Failed to load YouTube video metadata: {err_text}")
+                if "bot" in err_text.lower() or "sign in" in err_text.lower() or "cookie" in err_text.lower():
+                    st.warning(
+                        "🔒 **YouTube Cloud Bot-Check**: Cloud datacenters (like AWS/Streamlit Cloud) are frequently flagged by YouTube's bot wall.\n\n"
+                        "**3 Ways to resolve this:**\n"
+                        "1. **Paste Cookies (Instant)**: Open **'🍪 YouTube Cookies / Bot Bypass'** in the left sidebar and paste your exported YouTube `cookies.txt`.\n"
+                        "2. **Streamlit Secrets**: In your Streamlit Cloud Dashboard, go to **App Settings → Secrets** and add:\n"
+                        "   ```toml\n"
+                        "   YOUTUBE_COOKIES = '''<paste cookies.txt content here>'''\n"
+                        "   ```\n"
+                        "3. **Try Demo Mode**: Click **'🧪 Load Sample Heatmap Demo'** in the top-right to test video trimming & interactive charts immediately."
+                    )
 
 
 # ------------------------------------------------------------------------------

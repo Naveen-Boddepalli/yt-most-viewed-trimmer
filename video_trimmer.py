@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import List, Dict, Optional, Callable, Any
 
 from yt_processor import HighlightSegment
-from utils import sanitize_filename, format_timestamp, format_bytes, strip_ansi
+from utils import sanitize_filename, format_timestamp, format_bytes, strip_ansi, get_yt_cookies_file
 
 
 def get_ffmpeg_path() -> Optional[str]:
@@ -97,6 +97,8 @@ def download_full_video(
     ffmpeg_exe = ensure_ffmpeg()
     outtmpl = str(output_dir / "source_%(id)s.%(ext)s")
 
+    cookies_file = get_yt_cookies_file()
+
     ydl_opts: Dict[str, Any] = {
         "outtmpl": outtmpl,
         "quiet": True,
@@ -110,7 +112,15 @@ def download_full_video(
         "socket_timeout": 30,        # Don't hang on dropped sockets
         "http_chunk_size": 10485760, # 10 MB chunks to prevent YouTube CDN stream aborts
         "progress_hooks": [_hook],
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["ios", "android", "mweb", "web"],
+            }
+        },
     }
+
+    if cookies_file and Path(cookies_file).exists():
+        ydl_opts["cookiefile"] = str(cookies_file)
 
     if ffmpeg_exe:
         format_selector = (
@@ -177,6 +187,8 @@ def download_single_clip_section(
     stem = output_path.stem
     outtmpl = str(output_path.parent / f"{stem}.%(ext)s")
 
+    cookies_file = get_yt_cookies_file()
+
     ydl_opts: Dict[str, Any] = {
         "outtmpl": outtmpl,
         "quiet": True,
@@ -189,7 +201,15 @@ def download_single_clip_section(
         "fragment_retries": 15,
         "socket_timeout": 30,
         "progress_hooks": [_hook],
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["ios", "android", "mweb", "web"],
+            }
+        },
     }
+
+    if cookies_file and Path(cookies_file).exists():
+        ydl_opts["cookiefile"] = str(cookies_file)
 
     if ffmpeg_exe:
         ydl_opts["ffmpeg_location"] = ffmpeg_exe

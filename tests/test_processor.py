@@ -15,6 +15,7 @@ from utils import (
     sanitize_filename,
     format_bytes,
     strip_ansi,
+    get_yt_cookies_file,
 )
 from yt_processor import (
     extract_most_viewed_segments,
@@ -213,6 +214,10 @@ class TestYouTubeMostViewedTrimmer(unittest.TestCase):
         self.assertIn("end_time", sig1.parameters)
         sig2 = inspect.signature(download_and_trim_segments_direct)
         self.assertIn("segments", sig2.parameters)
+
+    def test_get_yt_cookies_file(self):
+        # Without any cookies file, returns None
+        self.assertIsNone(get_yt_cookies_file())
 
 
 if __name__ == "__main__":

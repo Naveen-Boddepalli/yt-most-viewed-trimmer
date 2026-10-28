@@ -32,18 +32,48 @@ class HighlightSegment:
         return d
 
 
-def fetch_video_metadata(url: str) -> Dict[str, Any]:
+def fetch_video_metadata(url: str, cookies_file: Optional[str] = None) -> Dict[str, Any]:
     """Fetch video metadata (including heatmap and chapters) without downloading the video."""
-    ydl_opts = {
+    import yt_dlp
+    from utils import get_yt_cookies_file
+
+    if not cookies_file:
+        cookies_file = get_yt_cookies_file()
+
+    ydl_opts: Dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
         "skip_download": True,
         "extract_flat": False,
+        "extractor_args": {
+            "youtube": {
+                # iOS, Android, and mweb clients bypass web datacenter IP bot detection
+                "player_client": ["ios", "android", "mweb", "web"],
+            }
+        },
     }
-    import yt_dlp
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-    return info
+    if cookies_file and Path(cookies_file).exists():
+        ydl_opts["cookiefile"] = str(cookies_file)
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            return ydl.extract_info(url, download=False)
+    except Exception as exc:
+        err_msg = str(exc).lower()
+        if "confirm you're not a bot" in err_msg or "sign in" in err_msg:
+            # Fallback client attempt with tv_embedded and android
+            alt_opts = dict(ydl_opts)
+            alt_opts["extractor_args"] = {
+                "youtube": {
+                    "player_client": ["tv_embedded", "android", "ios"],
+                }
+            }
+            try:
+                with yt_dlp.YoutubeDL(alt_opts) as ydl:
+                    return ydl.extract_info(url, download=False)
+            except Exception:
+                raise exc
+        raise exc
 
 
 def estimate_video_size(info: Optional[Dict[str, Any]], max_height: int = 720) -> int:

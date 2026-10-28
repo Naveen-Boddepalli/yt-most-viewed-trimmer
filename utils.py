@@ -1,7 +1,50 @@
 """Utility functions for timestamp formatting, validation, size formatting, and file cleanup."""
 
+import os
 import re
+import tempfile
+from pathlib import Path
 from typing import Tuple, Optional
+
+
+def get_yt_cookies_file() -> Optional[str]:
+    """
+    Check if YouTube cookies are available from:
+    1. Local cookies.txt file
+    2. Streamlit session_state (user pasted in sidebar)
+    3. Streamlit secrets (st.secrets["YOUTUBE_COOKIES"])
+    Returns the resolved string path to the cookie file or None.
+    """
+    # 1. Local cookies.txt file in current directory or workspace
+    local_cookie = Path("cookies.txt")
+    if local_cookie.exists() and local_cookie.stat().st_size > 0:
+        return str(local_cookie.resolve())
+
+    # 2. Check Streamlit session_state
+    try:
+        import streamlit as st
+        pasted = st.session_state.get("youtube_cookies_text")
+        if pasted and str(pasted).strip():
+            ws_dir = st.session_state.get("workspace_dir") or tempfile.gettempdir()
+            temp_cf = Path(ws_dir) / "session_cookies.txt"
+            temp_cf.write_text(str(pasted).strip(), encoding="utf-8")
+            return str(temp_cf.resolve())
+    except Exception:
+        pass
+
+    # 3. Check Streamlit secrets
+    try:
+        import streamlit as st
+        if hasattr(st, "secrets") and "YOUTUBE_COOKIES" in st.secrets:
+            secret_cookies = st.secrets["YOUTUBE_COOKIES"]
+            if secret_cookies and str(secret_cookies).strip():
+                temp_cf = Path(tempfile.gettempdir()) / "st_secrets_cookies.txt"
+                temp_cf.write_text(str(secret_cookies).strip(), encoding="utf-8")
+                return str(temp_cf.resolve())
+    except Exception:
+        pass
+
+    return None
 
 
 def format_bytes(size_bytes: Optional[float]) -> str:
