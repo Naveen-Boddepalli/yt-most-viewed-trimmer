@@ -1,17 +1,13 @@
----
-title: YouTube Most Viewed Trimmer
-emoji: 🎬
-colorFrom: red
-colorTo: indigo
-sdk: docker
-app_port: 7860
-pinned: false
-license: mit
+# 🎬 YouTube Most-Viewed Timestamp Extractor & Video Trimmer
+
+A Python + Streamlit web application that loads a YouTube video from its link, extracts the **Most Replayed (Most Viewed)** timestamp peaks from YouTube's engagement telemetry (`heatmap`), trims the video into top highlight segments, and lets you preview and download **either a particular clip (~10–15 MB) or all clips as a `.zip` bundle**.
+
 ---
 
-# 🎬 YouTube Most-Viewed Timestamp Extractor & Video Trimmer (Streamlit App)
-
-A Python + Streamlit web application that loads a YouTube video from its link, extracts the **Most Replayed (Most Viewed)** timestamp peaks from YouTube's engagement telemetry (`heatmap`), trims the video into those top highlight segments, and displays them inline for previewing and downloading **either a particular clip or all clips as a `.zip` bundle**.
+## ⚡ Direct Stream-Trim (Cloud Optimized)
+- **Zero Full-Video Download Required**: Directly streams and slices *only* the requested 30–60s highlight clip from YouTube's CDN using byte-range requests.
+- **Ultra-lightweight**: Downloads only **10–15 MB** per clip instead of 1–2 GB source videos.
+- **Fast**: Cuts and delivers clips in just 2–4 seconds.
 
 ---
 
@@ -35,6 +31,22 @@ A Python + Streamlit web application that loads a YouTube video from its link, e
 
 ---
 
+## ☁️ Deploying to Streamlit Community Cloud (100% Free Forever)
+
+This repository is pre-configured with `packages.txt` (installs FFmpeg) and both `app.py` / `streamlit_app.py` entrypoints.
+
+1. **Fork or Push** this repository to your GitHub account (`https://github.com/Naveen-Boddepalli/yt-most-viewed-trimmer`).
+   - *Ensure the repository is set to **Public** so Streamlit Cloud can access it.*
+2. Go to **[share.streamlit.io](https://share.streamlit.io)** and sign in with GitHub.
+3. Click **Deploy an app** (or **New app**).
+4. Fill in:
+   - **Repository**: `naveen-boddepalli/yt-most-viewed-trimmer`
+   - **Branch**: `main`
+   - **Main file path**: `app.py` *(or `streamlit_app.py`)*
+5. Click **Deploy!**
+
+---
+
 ## 📁 Project Structure
 
 ```text
@@ -44,21 +56,23 @@ yt_most_viewed_trimmer/
 ├── tests/
 │   └── test_processor.py    # Unit & integration tests (heatmap peaks + FFmpeg trimming)
 ├── app.py                   # Streamlit frontend UI
+├── streamlit_app.py         # Entrypoint for Streamlit Community Cloud
 ├── yt_processor.py          # YouTube metadata & Most-Replayed heatmap peak extractor
-├── video_trimmer.py         # Video download (yt-dlp) & segment trimming (FFmpeg / MoviePy)
+├── video_trimmer.py         # Direct stream trimming (yt-dlp) & FFmpeg segment cutter
 ├── utils.py                 # Timestamp parsing, formatting & URL validation helpers
+├── packages.txt             # System FFmpeg for Streamlit Cloud & Linux
 ├── requirements.txt         # Python package dependencies
 ├── .gitignore               # Ignored virtualenvs and temporary media files
-└── README.md                # Setup & usage documentation
+└── README.md                # Documentation
 ```
 
 ---
 
-## 🚀 Quickstart & Installation
+## 🚀 Local Installation & Run
 
 ### 1. Prerequisites
 - **Python 3.9+**
-- **FFmpeg** installed on your system `PATH` (recommended for fast, frame-accurate H.264 trimming and MP4 stream merging):
+- **FFmpeg** installed on your system `PATH`:
   - **macOS**: `brew install ffmpeg`
   - **Ubuntu / Debian**: `sudo apt update && sudo apt install -y ffmpeg`
   - **Windows**: `winget install Gyan.FFmpeg` or `choco install ffmpeg`
@@ -77,28 +91,3 @@ streamlit run app.py
 ```bash
 python3 -m unittest discover -s tests
 ```
-
----
-
-## 🤗 Deploying to Hugging Face Spaces (Free Cloud Hosting)
-
-This repository is pre-configured for 1-click hosting on **[Hugging Face Spaces](https://huggingface.co/spaces)**:
-
-1. **Create a new Space:**
-   - Go to [Hugging Face Spaces](https://huggingface.co/new-space).
-   - Give your space a name (e.g. `yt-most-viewed-trimmer`).
-   - Select **Streamlit** as the Space SDK.
-   - Choose **Public** or **Private**.
-2. **Push your code to the Space:**
-   - Clone your Hugging Face Space repository or push this repository directly:
-   ```bash
-   git remote add space https://huggingface.co/spaces/<your-username>/<your-space-name>
-   git push space main
-   ```
-3. **Automatic Setup:**
-   - Hugging Face automatically detects `packages.txt` and installs system `ffmpeg`.
-   - Hugging Face installs Python dependencies from `requirements.txt`.
-   - It launches `app.py` directly with **Direct Stream-Trim** enabled.
-4. **Enjoy:**
-   - You can open your Space URL on any phone or browser.
-   - Paste a YouTube URL, click Trim, and you only download the final lightweight 10–15 MB highlight clips!
