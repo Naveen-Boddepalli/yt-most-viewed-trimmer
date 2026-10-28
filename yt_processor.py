@@ -46,15 +46,18 @@ def fetch_video_metadata(url: str, cookies_file: Optional[str] = None) -> Dict[s
         "no_warnings": True,
         "skip_download": True,
         "extract_flat": False,
-        "extractor_args": {
-            "youtube": {
-                # iOS, Android, and mweb clients bypass web datacenter IP bot detection
-                "player_client": ["ios", "android", "mweb", "web"],
-            }
-        },
+        "ignore_no_formats_error": True,
     }
+
     if cookies_file and Path(cookies_file).exists():
         ydl_opts["cookiefile"] = str(cookies_file)
+    else:
+        # Without cookies, try mobile/web clients to help bypass datacenter IP bot detection
+        ydl_opts["extractor_args"] = {
+            "youtube": {
+                "player_client": ["mweb", "ios", "android", "web"],
+            }
+        }
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -62,7 +65,7 @@ def fetch_video_metadata(url: str, cookies_file: Optional[str] = None) -> Dict[s
     except Exception as exc:
         err_msg = str(exc).lower()
         if "confirm you're not a bot" in err_msg or "sign in" in err_msg:
-            # Fallback client attempt with tv_embedded and android
+            # Fallback client attempt with alternative clients
             alt_opts = dict(ydl_opts)
             alt_opts["extractor_args"] = {
                 "youtube": {

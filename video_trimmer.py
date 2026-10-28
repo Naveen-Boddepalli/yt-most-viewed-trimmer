@@ -112,20 +112,22 @@ def download_full_video(
         "socket_timeout": 30,        # Don't hang on dropped sockets
         "http_chunk_size": 10485760, # 10 MB chunks to prevent YouTube CDN stream aborts
         "progress_hooks": [_hook],
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["ios", "android", "mweb", "web"],
-            }
-        },
     }
 
     if cookies_file and Path(cookies_file).exists():
         ydl_opts["cookiefile"] = str(cookies_file)
+    else:
+        ydl_opts["extractor_args"] = {
+            "youtube": {
+                "player_client": ["mweb", "ios", "android", "web"],
+            }
+        }
 
     if ffmpeg_exe:
         format_selector = (
+            f"bestvideo[height<={max_height}]+bestaudio/"
             f"bestvideo[height<={max_height}][ext=mp4]+bestaudio[ext=m4a]/"
-            f"best[height<={max_height}][ext=mp4]/best[height<={max_height}]/best"
+            f"best[height<={max_height}]/best"
         )
         ydl_opts["format"] = format_selector
         ydl_opts["ffmpeg_location"] = ffmpeg_exe
@@ -133,7 +135,7 @@ def download_full_video(
     else:
         # Fallback to single progressive stream to avoid requiring stream merging
         format_selector = (
-            f"best[height<={max_height}][ext=mp4]/best[height<={max_height}]/best[ext=mp4]/best"
+            f"best[height<={max_height}]/best[ext=mp4]/best"
         )
         ydl_opts["format"] = format_selector
 
@@ -201,26 +203,28 @@ def download_single_clip_section(
         "fragment_retries": 15,
         "socket_timeout": 30,
         "progress_hooks": [_hook],
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["ios", "android", "mweb", "web"],
-            }
-        },
     }
 
     if cookies_file and Path(cookies_file).exists():
         ydl_opts["cookiefile"] = str(cookies_file)
+    else:
+        ydl_opts["extractor_args"] = {
+            "youtube": {
+                "player_client": ["mweb", "ios", "android", "web"],
+            }
+        }
 
     if ffmpeg_exe:
         ydl_opts["ffmpeg_location"] = ffmpeg_exe
         ydl_opts["merge_output_format"] = "mp4"
         ydl_opts["format"] = (
+            f"bestvideo[height<={max_height}]+bestaudio/"
             f"bestvideo[height<={max_height}][ext=mp4]+bestaudio[ext=m4a]/"
-            f"best[height<={max_height}][ext=mp4]/best[height<={max_height}]/best"
+            f"best[height<={max_height}]/best"
         )
     else:
         ydl_opts["format"] = (
-            f"best[height<={max_height}][ext=mp4]/best[height<={max_height}]/best[ext=mp4]/best"
+            f"best[height<={max_height}]/best[ext=mp4]/best"
         )
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
