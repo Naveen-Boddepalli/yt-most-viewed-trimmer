@@ -1,9 +1,15 @@
 """YouTube metadata & Most-Replayed (heatmap) timestamp extraction module."""
 
+import sys
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 import re
+
+_ROOT = Path(__file__).resolve().parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
 from utils import format_timestamp
 
 

@@ -1,11 +1,16 @@
 """Video downloading and timestamp trimming module using yt-dlp, FFmpeg, and MoviePy."""
 
 import os
+import sys
 import shutil
 import subprocess
 import zipfile
 from pathlib import Path
 from typing import List, Dict, Optional, Callable, Any
+
+_ROOT = Path(__file__).resolve().parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 from yt_processor import HighlightSegment
 from utils import sanitize_filename, format_timestamp, format_bytes, strip_ansi, get_yt_cookies_file

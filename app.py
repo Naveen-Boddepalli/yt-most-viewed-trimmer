@@ -4,10 +4,21 @@ YouTube Most-Viewed Timestamp Extractor & Video Trimmer
 """
 
 import os
+import sys
+from pathlib import Path
+
+# Streamlit Cloud deployment safeguard: ensure app directory is at the head of sys.path
+PROJECT_ROOT = Path(__file__).resolve().parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+try:
+    os.chdir(PROJECT_ROOT)
+except Exception:
+    pass
+
 import shutil
 import tempfile
 import inspect
-from pathlib import Path
 from typing import Dict, List
 
 import pandas as pd
