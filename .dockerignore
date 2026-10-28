@@ -1,0 +1,10 @@
+.git
+.gitignore
+.pytest_cache
+__pycache__
+*.pyc
+*.part
+*.mp4
+*.zip
+downloads
+trimmed_clips

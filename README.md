@@ -3,9 +3,8 @@ title: YouTube Most Viewed Trimmer
 emoji: 🎬
 colorFrom: red
 colorTo: indigo
-sdk: streamlit
-sdk_version: 1.42.0
-app_file: app.py
+sdk: docker
+app_port: 7860
 pinned: false
 license: mit
 ---
