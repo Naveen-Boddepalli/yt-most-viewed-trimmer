@@ -35,6 +35,8 @@ def is_ffmpeg_executable(path: Optional[str]) -> bool:
 
 def get_ffmpeg_path() -> Optional[str]:
     """Find a verified working ffmpeg executable from system, imageio-ffmpeg, or static-ffmpeg."""
+    import tempfile
+
     # 1. Check system PATH and standard Linux/Mac paths FIRST (fastest, 0ms)
     candidates = [
         shutil.which("ffmpeg"),
@@ -48,33 +50,52 @@ def get_ffmpeg_path() -> Optional[str]:
         if loc and os.path.exists(loc) and is_ffmpeg_executable(loc):
             return loc
 
-    # 2. Check imageio_ffmpeg (directly check and ensure execute permission on binary)
+    # 2. Check imageio_ffmpeg: copy binary to user-writable tempdir and chmod 0o755
     try:
         import imageio_ffmpeg
         bin_dir = Path(imageio_ffmpeg.__file__).resolve().parent / "binaries"
+        target = Path(tempfile.gettempdir()) / "ffmpeg_bin" / "ffmpeg"
+        target.parent.mkdir(parents=True, exist_ok=True)
+
         if bin_dir.exists():
             for f in bin_dir.glob("ffmpeg*"):
                 if f.is_file():
                     try:
-                        f.chmod(0o755)
+                        shutil.copy2(f, target)
+                        target.chmod(0o755)
+                        if is_ffmpeg_executable(str(target)):
+                            return str(target)
                     except Exception:
                         pass
-                    if is_ffmpeg_executable(str(f)):
-                        return str(f)
-        img_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        if img_exe:
-            try:
-                Path(img_exe).chmod(0o755)
-            except Exception:
-                pass
-            if is_ffmpeg_executable(img_exe):
-                return img_exe
+
+        try:
+            img_exe = imageio_ffmpeg.get_ffmpeg_exe()
+            if img_exe and os.path.exists(img_exe):
+                shutil.copy2(img_exe, target)
+                target.chmod(0o755)
+                if is_ffmpeg_executable(str(target)):
+                    return str(target)
+        except Exception:
+            pass
     except Exception:
         pass
 
-    # 3. Check static_ffmpeg as fallback (weak=True: only if not already on path)
+    # 3. Check static_ffmpeg as fallback
     try:
         import static_ffmpeg
+        sdir = Path(static_ffmpeg.__file__).resolve().parent / "bin"
+        if sdir.exists():
+            target = Path(tempfile.gettempdir()) / "ffmpeg_bin" / "ffmpeg"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            for f in sdir.glob("**/ffmpeg*"):
+                if f.is_file() and not f.name.endswith(".zip"):
+                    try:
+                        shutil.copy2(f, target)
+                        target.chmod(0o755)
+                        if is_ffmpeg_executable(str(target)):
+                            return str(target)
+                    except Exception:
+                        pass
         static_ffmpeg.add_paths(weak=True)
         exe = shutil.which("ffmpeg")
         if exe and is_ffmpeg_executable(exe):
@@ -91,6 +112,7 @@ def ensure_ffmpeg() -> Optional[str]:
     and accessible via a standard 'ffmpeg' binary shim in tempdir and PATH.
     Returns the resolved executable path or None if unavailable.
     """
+    import tempfile
     exe = get_ffmpeg_path()
     if not exe:
         return None
@@ -106,7 +128,6 @@ def ensure_ffmpeg() -> Optional[str]:
         return exe
 
     # Create a guaranteed standard 'ffmpeg' binary shim in tempdir (always writable on Linux)
-    import tempfile
     tmp_bin = Path(tempfile.gettempdir()) / "ffmpeg_bin"
     tmp_bin.mkdir(parents=True, exist_ok=True)
     shim = tmp_bin / "ffmpeg"
@@ -114,11 +135,11 @@ def ensure_ffmpeg() -> Optional[str]:
         try:
             if shim.exists() or shim.is_symlink():
                 shim.unlink()
-            os.symlink(exe, shim)
+            shutil.copy2(exe, shim)
+            shim.chmod(0o755)
         except Exception:
             try:
-                shutil.copy2(exe, shim)
-                shim.chmod(0o755)
+                os.symlink(exe, shim)
             except Exception:
                 pass
 
@@ -129,6 +150,47 @@ def ensure_ffmpeg() -> Optional[str]:
         return str(shim)
 
     return exe
+
+
+def get_ffmpeg_diagnostics() -> Dict[str, Any]:
+    """Return comprehensive diagnostics about FFmpeg discovery for troubleshooting."""
+    import sys, tempfile
+    diag: Dict[str, Any] = {}
+    diag["python"] = sys.version.split()[0]
+    diag["shutil_which"] = shutil.which("ffmpeg")
+    diag["PATH"] = os.environ.get("PATH", "")
+
+    for p in ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]:
+        exists = os.path.exists(p)
+        diag[f"exists_{p}"] = exists
+        if exists:
+            try:
+                proc = subprocess.run([p, "-version"], capture_output=True, text=True, timeout=3)
+                diag[f"run_{p}"] = f"code={proc.returncode}, out={proc.stdout[:40]}"
+            except Exception as e:
+                diag[f"run_{p}_err"] = str(e)
+
+    try:
+        import imageio_ffmpeg
+        diag["imageio_ffmpeg_file"] = imageio_ffmpeg.__file__
+        bdir = Path(imageio_ffmpeg.__file__).resolve().parent / "binaries"
+        diag["imageio_binaries_exists"] = bdir.exists()
+        if bdir.exists():
+            diag["imageio_files"] = [f.name for f in bdir.glob("*")]
+    except Exception as e:
+        diag["imageio_err"] = str(e)
+
+    tmp_target = Path(tempfile.gettempdir()) / "ffmpeg_bin" / "ffmpeg"
+    diag["tmp_target_exists"] = tmp_target.exists()
+    if tmp_target.exists():
+        try:
+            proc = subprocess.run([str(tmp_target), "-version"], capture_output=True, text=True, timeout=3)
+            diag["tmp_target_run"] = f"code={proc.returncode}, out={proc.stdout[:40]}"
+        except Exception as e:
+            diag["tmp_target_err"] = str(e)
+
+    diag["ensure_ffmpeg_result"] = ensure_ffmpeg()
+    return diag
 
 
 # Initialize ffmpeg on import

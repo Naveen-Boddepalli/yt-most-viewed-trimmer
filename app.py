@@ -46,6 +46,7 @@ from yt_processor import (
 from video_trimmer import (
     has_ffmpeg,
     ensure_ffmpeg,
+    get_ffmpeg_diagnostics,
     download_full_video,
     download_single_clip_section,
     download_and_trim_segments_direct,
@@ -315,11 +316,9 @@ with st.sidebar:
         st.success(f"✅ FFmpeg active: `{Path(active_ffmpeg).name}`")
     else:
         st.error("⚠️ FFmpeg binary not found")
-        st.caption(
-            "💡 **To install FFmpeg on Streamlit Cloud:**\n"
-            "Click **'Manage app'** (bottom-right) ➔ **'⋮' (three dots)** ➔ **'Reboot app'** "
-            "so the container builds with `packages.txt`."
-        )
+
+    with st.expander("🔍 FFmpeg Diagnostics"):
+        st.json(get_ffmpeg_diagnostics())
 
     if st.button("🗑️ Clear Temporary Workspace", **STRETCH_WIDTH):
         ws = Path(st.session_state["workspace_dir"])
