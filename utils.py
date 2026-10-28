@@ -10,37 +10,38 @@ from typing import Tuple, Optional
 def get_yt_cookies_file() -> Optional[str]:
     """
     Check if YouTube cookies are available from:
-    1. Local cookies.txt file
-    2. Streamlit session_state (user pasted in sidebar)
-    3. Streamlit secrets (st.secrets["YOUTUBE_COOKIES"])
+    1. Persistent user_cookies.txt or local cookies.txt
+    2. Streamlit secrets (st.secrets["YOUTUBE_COOKIES"])
+    3. Streamlit session_state (user pasted in sidebar)
     Returns the resolved string path to the cookie file or None.
     """
-    # 1. Local cookies.txt file in current directory or workspace
-    local_cookie = Path("cookies.txt")
-    if local_cookie.exists() and local_cookie.stat().st_size > 0:
-        return str(local_cookie.resolve())
+    # 1. Check persistent user_cookies.txt or cookies.txt on disk
+    for fname in ["user_cookies.txt", "cookies.txt"]:
+        p = Path(fname)
+        if p.exists() and p.stat().st_size > 0:
+            return str(p.resolve())
 
-    # 2. Check Streamlit session_state
+    # 2. Check Streamlit secrets (permanent cloud storage)
+    try:
+        import streamlit as st
+        for key in ["YOUTUBE_COOKIES", "youtube_cookies", "cookies"]:
+            if hasattr(st, "secrets") and key in st.secrets:
+                val = st.secrets[key]
+                if val and str(val).strip():
+                    temp_cf = Path(tempfile.gettempdir()) / "st_secrets_cookies.txt"
+                    temp_cf.write_text(str(val).strip(), encoding="utf-8")
+                    return str(temp_cf.resolve())
+    except Exception:
+        pass
+
+    # 3. Check Streamlit session_state
     try:
         import streamlit as st
         pasted = st.session_state.get("youtube_cookies_text")
         if pasted and str(pasted).strip():
-            ws_dir = st.session_state.get("workspace_dir") or tempfile.gettempdir()
-            temp_cf = Path(ws_dir) / "session_cookies.txt"
+            temp_cf = Path(tempfile.gettempdir()) / "session_cookies.txt"
             temp_cf.write_text(str(pasted).strip(), encoding="utf-8")
             return str(temp_cf.resolve())
-    except Exception:
-        pass
-
-    # 3. Check Streamlit secrets
-    try:
-        import streamlit as st
-        if hasattr(st, "secrets") and "YOUTUBE_COOKIES" in st.secrets:
-            secret_cookies = st.secrets["YOUTUBE_COOKIES"]
-            if secret_cookies and str(secret_cookies).strip():
-                temp_cf = Path(tempfile.gettempdir()) / "st_secrets_cookies.txt"
-                temp_cf.write_text(str(secret_cookies).strip(), encoding="utf-8")
-                return str(temp_cf.resolve())
     except Exception:
         pass
 

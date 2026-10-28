@@ -21,6 +21,7 @@ from utils import (
     sanitize_filename,
     format_bytes,
     strip_ansi,
+    get_yt_cookies_file,
 )
 from yt_processor import (
     HighlightSegment,
@@ -105,6 +106,13 @@ def init_session_state():
     for k, v in defaults.items():
         if k not in st.session_state:
             st.session_state[k] = v
+
+    if "youtube_cookies_text" not in st.session_state:
+        saved_cf = Path("user_cookies.txt")
+        if saved_cf.exists() and saved_cf.stat().st_size > 0:
+            st.session_state["youtube_cookies_text"] = saved_cf.read_text(encoding="utf-8")
+        else:
+            st.session_state["youtube_cookies_text"] = ""
 
 
 init_session_state()
@@ -259,22 +267,35 @@ with st.sidebar:
     )
     is_direct_stream_trim = "Direct Stream-Trim" in trim_strategy
 
-    with st.expander("🍪 YouTube Cookies / Bot Bypass", expanded=False):
+    has_active_cookies = bool(get_yt_cookies_file())
+    with st.expander(f"🍪 YouTube Cookies / Bot Bypass {'(Active ✅)' if has_active_cookies else ''}", expanded=not has_active_cookies):
         st.caption(
-            "Cloud servers (Streamlit Cloud, AWS) can occasionally be flagged by YouTube's bot detection. "
-            "You can paste your YouTube `cookies.txt` here or add `YOUTUBE_COOKIES` in Streamlit Cloud Secrets."
+            "Cloud servers (Streamlit Cloud, AWS) are flagged by YouTube's bot detection. "
+            "Pasting your `cookies.txt` here saves it persistently on this server so you never have to paste again."
         )
         cookie_text = st.text_area(
             "Paste cookies.txt content",
             value=st.session_state.get("youtube_cookies_text", ""),
             placeholder="# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t...\t...",
             height=120,
+            key="cookie_textarea_box",
             help="Export cookies from your browser using an extension like 'Get cookies.txt LOCALLY'.",
         )
-        if cookie_text != st.session_state.get("youtube_cookies_text", ""):
-            st.session_state["youtube_cookies_text"] = cookie_text
-        if st.session_state.get("youtube_cookies_text"):
-            st.success("✅ Cookies active for this session")
+        if cookie_text.strip() and cookie_text.strip() != st.session_state.get("youtube_cookies_text", ""):
+            Path("user_cookies.txt").write_text(cookie_text.strip(), encoding="utf-8")
+            st.session_state["youtube_cookies_text"] = cookie_text.strip()
+            st.rerun()
+
+        col_c1, col_c2 = st.columns([1, 1])
+        with col_c1:
+            if has_active_cookies:
+                st.success("✅ Cookies active & saved!")
+        with col_c2:
+            if has_active_cookies and st.button("🗑️ Clear Cookies", **STRETCH_WIDTH):
+                if Path("user_cookies.txt").exists():
+                    Path("user_cookies.txt").unlink()
+                st.session_state["youtube_cookies_text"] = ""
+                st.rerun()
 
     st.divider()
     ffmpeg_ok = has_ffmpeg()

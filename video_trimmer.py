@@ -126,8 +126,9 @@ def download_full_video(
     if ffmpeg_exe:
         format_selector = (
             f"bestvideo[height<={max_height}]+bestaudio/"
-            f"bestvideo[height<={max_height}][ext=mp4]+bestaudio[ext=m4a]/"
-            f"best[height<={max_height}]/best"
+            f"bestvideo*+bestaudio/"
+            f"best[height<={max_height}]/"
+            f"best"
         )
         ydl_opts["format"] = format_selector
         ydl_opts["ffmpeg_location"] = ffmpeg_exe
@@ -135,7 +136,7 @@ def download_full_video(
     else:
         # Fallback to single progressive stream to avoid requiring stream merging
         format_selector = (
-            f"best[height<={max_height}]/best[ext=mp4]/best"
+            f"best[height<={max_height}]/best"
         )
         ydl_opts["format"] = format_selector
 
@@ -219,12 +220,13 @@ def download_single_clip_section(
         ydl_opts["merge_output_format"] = "mp4"
         ydl_opts["format"] = (
             f"bestvideo[height<={max_height}]+bestaudio/"
-            f"bestvideo[height<={max_height}][ext=mp4]+bestaudio[ext=m4a]/"
-            f"best[height<={max_height}]/best"
+            f"bestvideo*+bestaudio/"
+            f"best[height<={max_height}]/"
+            f"best"
         )
     else:
         ydl_opts["format"] = (
-            f"best[height<={max_height}]/best[ext=mp4]/best"
+            f"best[height<={max_height}]/best"
         )
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
