@@ -310,11 +310,11 @@ with st.sidebar:
                 st.rerun()
 
     st.divider()
-    ffmpeg_ok = has_ffmpeg()
-    if ffmpeg_ok:
-        st.success("✅ FFmpeg ready (bundled / system PATH)")
+    active_ffmpeg = ensure_ffmpeg()
+    if active_ffmpeg:
+        st.success(f"✅ FFmpeg active: `{Path(active_ffmpeg).name}`")
     else:
-        st.warning("⚠️ FFmpeg CLI not found — will use MoviePy fallback")
+        st.warning("⚠️ FFmpeg binary not found")
 
     if st.button("🗑️ Clear Temporary Workspace", **STRETCH_WIDTH):
         ws = Path(st.session_state["workspace_dir"])

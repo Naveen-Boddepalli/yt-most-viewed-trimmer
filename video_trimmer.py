@@ -58,12 +58,27 @@ def get_ffmpeg_path() -> Optional[str]:
         if os.path.exists(loc) and is_ffmpeg_executable(loc):
             return loc
 
-    # 3. imageio_ffmpeg
+    # 3. imageio_ffmpeg (directly check and ensure execute permission on binary)
     try:
         import imageio_ffmpeg
+        bin_dir = Path(imageio_ffmpeg.__file__).resolve().parent / "binaries"
+        if bin_dir.exists():
+            for f in bin_dir.glob("ffmpeg*"):
+                if f.is_file():
+                    try:
+                        f.chmod(0o755)
+                    except Exception:
+                        pass
+                    if is_ffmpeg_executable(str(f)):
+                        return str(f)
         img_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        if img_exe and is_ffmpeg_executable(img_exe):
-            return img_exe
+        if img_exe:
+            try:
+                Path(img_exe).chmod(0o755)
+            except Exception:
+                pass
+            if is_ffmpeg_executable(img_exe):
+                return img_exe
     except Exception:
         pass
 
@@ -72,26 +87,28 @@ def get_ffmpeg_path() -> Optional[str]:
 
 def ensure_ffmpeg() -> Optional[str]:
     """
-    Ensure ffmpeg is available, verified runnable, and on os.environ['PATH'].
+    Ensure ffmpeg is available, verified runnable, on os.environ['PATH'],
+    and accessible via a standard 'ffmpeg' binary shim in tempdir and PATH.
     Returns the resolved executable path or None if unavailable.
     """
     exe = get_ffmpeg_path()
     if not exe:
         return None
 
-    # Prepend directory to PATH so yt-dlp and other tools find 'ffmpeg' command directly
+    # Prepend directory of exe to PATH
     exe_dir = str(Path(exe).resolve().parent)
     cur_path = os.environ.get("PATH", "")
     if exe_dir not in cur_path.split(os.pathsep):
         os.environ["PATH"] = f"{exe_dir}{os.pathsep}{cur_path}"
 
-    # Also make sure 'ffmpeg' command name is available via a local shim if exe has a different filename
-    bin_dir = Path(__file__).resolve().parent / ".bin"
-    bin_dir.mkdir(parents=True, exist_ok=True)
-    shim = bin_dir / "ffmpeg"
+    # Create a guaranteed standard 'ffmpeg' binary shim in tempdir (always writable on Linux)
+    import tempfile
+    tmp_bin = Path(tempfile.gettempdir()) / "ffmpeg_bin"
+    tmp_bin.mkdir(parents=True, exist_ok=True)
+    shim = tmp_bin / "ffmpeg"
     if not shim.exists() or not is_ffmpeg_executable(str(shim)):
         try:
-            if shim.exists():
+            if shim.exists() or shim.is_symlink():
                 shim.unlink()
             os.symlink(exe, shim)
         except Exception:
@@ -100,8 +117,9 @@ def ensure_ffmpeg() -> Optional[str]:
                 shim.chmod(0o755)
             except Exception:
                 pass
-    if str(bin_dir) not in os.environ.get("PATH", "").split(os.pathsep):
-        os.environ["PATH"] = f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"
+
+    if str(tmp_bin) not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = f"{tmp_bin}{os.pathsep}{os.environ.get('PATH', '')}"
 
     if shim.exists() and is_ffmpeg_executable(str(shim)):
         return str(shim)
@@ -166,7 +184,7 @@ def download_full_video(
         "progress_hooks": [_hook],
         "extractor_args": {
             "youtube": {
-                "player_client": ["visionos", "android", "tv", "web"],
+                "player_client": ["visionos"],
             }
         },
     }
@@ -192,8 +210,17 @@ def download_full_video(
         ydl_opts["format"] = format_selector
 
     import yt_dlp
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+    except Exception as exc:
+        if "403" in str(exc) and "cookiefile" in ydl_opts:
+            # Datacenter IP rejected residential cookies; retry without cookies
+            del ydl_opts["cookiefile"]
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+        else:
+            raise
         video_id = info.get("id", "video")
         # Locate downloaded file
         expected_mp4 = output_dir / f"source_{video_id}.mp4"
@@ -257,7 +284,7 @@ def download_single_clip_section(
         "progress_hooks": [_hook],
         "extractor_args": {
             "youtube": {
-                "player_client": ["visionos", "android", "tv", "web"],
+                "player_client": ["visionos"],
             }
         },
     }
@@ -279,8 +306,17 @@ def download_single_clip_section(
             f"best[height<={max_height}][ext=mp4]/best[height<={max_height}]/best[ext=mp4]/best"
         )
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        ydl.download([url])
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([url])
+    except Exception as exc:
+        if "403" in str(exc) and "cookiefile" in ydl_opts:
+            # Datacenter IP rejected residential cookies; retry without cookies
+            del ydl_opts["cookiefile"]
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+        else:
+            raise
 
     # Check if exact output_path exists
     if output_path.exists() and output_path.stat().st_size > 0:
