@@ -731,6 +731,7 @@ if info:
                     trimmed_map = {target_seg.rank: clip_path}
                 except Exception as exc:
                     prog_bar.empty()
+                    st.warning(f"ℹ️ Direct stream note: {strip_ansi(str(exc))[:220]}")
                     # Fallback to full download if stream slice fails
                     st.info("Direct stream slice fallback: downloading source video...")
                     src_path = ensure_source_video()

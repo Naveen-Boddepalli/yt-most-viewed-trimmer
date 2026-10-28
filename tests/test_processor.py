@@ -16,6 +16,7 @@ from utils import (
     format_bytes,
     strip_ansi,
     get_yt_cookies_file,
+    sanitize_cookie_content,
 )
 from yt_processor import (
     extract_most_viewed_segments,
@@ -216,8 +217,16 @@ class TestYouTubeMostViewedTrimmer(unittest.TestCase):
         self.assertIn("segments", sig2.parameters)
 
     def test_get_yt_cookies_file(self):
-        # Without any cookies file, returns None
-        self.assertIsNone(get_yt_cookies_file())
+        # Test sanitize_cookie_content header injection
+        raw = "example.com\tTRUE\t/\tTRUE\t0\tfoo\tbar"
+        sanitized = sanitize_cookie_content(raw)
+        self.assertTrue(sanitized.startswith("# Netscape HTTP Cookie File"))
+
+        res = get_yt_cookies_file()
+        if not Path("user_cookies.txt").exists() and not Path("cookies.txt").exists():
+            self.assertIsNone(res)
+        else:
+            self.assertTrue(res is not None and Path(res).exists())
 
 
 if __name__ == "__main__":

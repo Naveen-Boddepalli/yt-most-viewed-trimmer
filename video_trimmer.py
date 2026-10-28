@@ -86,18 +86,24 @@ def ensure_ffmpeg() -> Optional[str]:
         os.environ["PATH"] = f"{exe_dir}{os.pathsep}{cur_path}"
 
     # Also make sure 'ffmpeg' command name is available via a local shim if exe has a different filename
-    if shutil.which("ffmpeg") is None:
-        bin_dir = Path(__file__).resolve().parent / ".bin"
-        bin_dir.mkdir(parents=True, exist_ok=True)
-        shim = bin_dir / "ffmpeg"
-        if not shim.exists():
+    bin_dir = Path(__file__).resolve().parent / ".bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    shim = bin_dir / "ffmpeg"
+    if not shim.exists() or not is_ffmpeg_executable(str(shim)):
+        try:
+            if shim.exists():
+                shim.unlink()
+            os.symlink(exe, shim)
+        except Exception:
             try:
-                os.symlink(exe, shim)
-            except Exception:
                 shutil.copy2(exe, shim)
                 shim.chmod(0o755)
-        if str(bin_dir) not in os.environ.get("PATH", "").split(os.pathsep):
-            os.environ["PATH"] = f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"
+            except Exception:
+                pass
+    if str(bin_dir) not in os.environ.get("PATH", "").split(os.pathsep):
+        os.environ["PATH"] = f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"
+
+    if shim.exists() and is_ffmpeg_executable(str(shim)):
         return str(shim)
 
     return exe
@@ -160,7 +166,7 @@ def download_full_video(
         "progress_hooks": [_hook],
         "extractor_args": {
             "youtube": {
-                "player_client": ["visionos", "web", "mweb"],
+                "player_client": ["visionos", "android", "tv", "web"],
             }
         },
     }
@@ -176,7 +182,7 @@ def download_full_video(
             f"best"
         )
         ydl_opts["format"] = format_selector
-        ydl_opts["ffmpeg_location"] = str(Path(ffmpeg_exe).parent)
+        ydl_opts["ffmpeg_location"] = str(ffmpeg_exe)
         ydl_opts["merge_output_format"] = "mp4"
     else:
         # Fallback to single progressive stream to avoid requiring stream merging
@@ -251,7 +257,7 @@ def download_single_clip_section(
         "progress_hooks": [_hook],
         "extractor_args": {
             "youtube": {
-                "player_client": ["visionos", "web", "mweb"],
+                "player_client": ["visionos", "android", "tv", "web"],
             }
         },
     }
@@ -260,7 +266,7 @@ def download_single_clip_section(
         ydl_opts["cookiefile"] = str(cookies_file)
 
     if ffmpeg_exe and is_ffmpeg_executable(ffmpeg_exe):
-        ydl_opts["ffmpeg_location"] = str(Path(ffmpeg_exe).parent)
+        ydl_opts["ffmpeg_location"] = str(ffmpeg_exe)
         ydl_opts["merge_output_format"] = "mp4"
         ydl_opts["format"] = (
             f"bestvideo[height<={max_height}]+bestaudio/"
