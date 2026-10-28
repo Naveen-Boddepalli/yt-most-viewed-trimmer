@@ -11,36 +11,76 @@ from yt_processor import HighlightSegment
 from utils import sanitize_filename, format_timestamp, format_bytes, strip_ansi, get_yt_cookies_file
 
 
+def is_ffmpeg_executable(path: Optional[str]) -> bool:
+    """Verify that a path points to an executable and runnable ffmpeg binary."""
+    if not path:
+        return False
+    try:
+        proc = subprocess.run(
+            [path, "-version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=5,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
 def get_ffmpeg_path() -> Optional[str]:
-    """Find ffmpeg executable from PATH, standard system paths, or imageio_ffmpeg."""
+    """Find a verified working ffmpeg executable from PATH, static-ffmpeg, imageio-ffmpeg, or standard paths."""
+    # 0. Try static_ffmpeg if available
+    try:
+        import static_ffmpeg
+        static_ffmpeg.add_paths()
+    except Exception:
+        pass
+
+    # 1. System PATH
     exe = shutil.which("ffmpeg")
-    if exe:
+    if exe and is_ffmpeg_executable(exe):
         return exe
-    for loc in ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]:
-        if os.path.exists(loc) and os.access(loc, os.X_OK):
+
+    # 2. Standard system locations
+    for loc in [
+        "/usr/bin/ffmpeg",
+        "/usr/local/bin/ffmpeg",
+        "/opt/homebrew/bin/ffmpeg",
+        "/home/appuser/.local/bin/ffmpeg",
+        "/app/.bin/ffmpeg",
+    ]:
+        if os.path.exists(loc) and is_ffmpeg_executable(loc):
             return loc
+
+    # 3. imageio_ffmpeg
     try:
         import imageio_ffmpeg
         img_exe = imageio_ffmpeg.get_ffmpeg_exe()
-        if img_exe and os.path.exists(img_exe):
+        if img_exe and is_ffmpeg_executable(img_exe):
             return img_exe
     except Exception:
         pass
+
     return None
 
 
 def ensure_ffmpeg() -> Optional[str]:
     """
-    Ensure ffmpeg is available and callable.
-    If ffmpeg is not already on PATH, creates a shim in a local .bin directory
-    pointing to imageio_ffmpeg's binary and prepends it to os.environ['PATH'].
-    Returns the resolved ffmpeg executable path, or None if unavailable.
+    Ensure ffmpeg is available, verified runnable, and on os.environ['PATH'].
+    Returns the resolved executable path or None if unavailable.
     """
     exe = get_ffmpeg_path()
     if not exe:
         return None
 
-    # If 'ffmpeg' is not directly executable by command name, create a shim
+    # Prepend directory to PATH so yt-dlp and other tools find 'ffmpeg' command directly
+    exe_dir = str(Path(exe).resolve().parent)
+    cur_path = os.environ.get("PATH", "")
+    if exe_dir not in cur_path.split(os.pathsep):
+        os.environ["PATH"] = f"{exe_dir}{os.pathsep}{cur_path}"
+
+    # Also make sure 'ffmpeg' command name is available via a local shim if exe has a different filename
     if shutil.which("ffmpeg") is None:
         bin_dir = Path(__file__).resolve().parent / ".bin"
         bin_dir.mkdir(parents=True, exist_ok=True)
@@ -51,10 +91,10 @@ def ensure_ffmpeg() -> Optional[str]:
             except Exception:
                 shutil.copy2(exe, shim)
                 shim.chmod(0o755)
-        cur_path = os.environ.get("PATH", "")
-        if str(bin_dir) not in cur_path:
-            os.environ["PATH"] = f"{bin_dir}:{cur_path}"
+        if str(bin_dir) not in os.environ.get("PATH", "").split(os.pathsep):
+            os.environ["PATH"] = f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"
         return str(shim)
+
     return exe
 
 
@@ -63,8 +103,9 @@ ensure_ffmpeg()
 
 
 def has_ffmpeg() -> bool:
-    """Check if ffmpeg is installed and available on system PATH or via imageio-ffmpeg."""
-    return ensure_ffmpeg() is not None
+    """Check if ffmpeg is verified installed and runnable."""
+    exe = ensure_ffmpeg()
+    return bool(exe and is_ffmpeg_executable(exe))
 
 
 def download_full_video(
@@ -122,7 +163,7 @@ def download_full_video(
     if cookies_file and Path(cookies_file).exists():
         ydl_opts["cookiefile"] = str(cookies_file)
 
-    if ffmpeg_exe:
+    if ffmpeg_exe and is_ffmpeg_executable(ffmpeg_exe):
         format_selector = (
             f"bestvideo[height<={max_height}]+bestaudio/"
             f"bestvideo*+bestaudio/"
@@ -130,12 +171,12 @@ def download_full_video(
             f"best"
         )
         ydl_opts["format"] = format_selector
-        ydl_opts["ffmpeg_location"] = ffmpeg_exe
+        ydl_opts["ffmpeg_location"] = str(Path(ffmpeg_exe).parent)
         ydl_opts["merge_output_format"] = "mp4"
     else:
         # Fallback to single progressive stream to avoid requiring stream merging
         format_selector = (
-            f"best[height<={max_height}]/best"
+            f"best[height<={max_height}][ext=mp4]/best[height<={max_height}]/best[ext=mp4]/best"
         )
         ydl_opts["format"] = format_selector
 
@@ -213,8 +254,8 @@ def download_single_clip_section(
     if cookies_file and Path(cookies_file).exists():
         ydl_opts["cookiefile"] = str(cookies_file)
 
-    if ffmpeg_exe:
-        ydl_opts["ffmpeg_location"] = ffmpeg_exe
+    if ffmpeg_exe and is_ffmpeg_executable(ffmpeg_exe):
+        ydl_opts["ffmpeg_location"] = str(Path(ffmpeg_exe).parent)
         ydl_opts["merge_output_format"] = "mp4"
         ydl_opts["format"] = (
             f"bestvideo[height<={max_height}]+bestaudio/"
@@ -224,7 +265,7 @@ def download_single_clip_section(
         )
     else:
         ydl_opts["format"] = (
-            f"best[height<={max_height}]/best"
+            f"best[height<={max_height}][ext=mp4]/best[height<={max_height}]/best[ext=mp4]/best"
         )
 
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
