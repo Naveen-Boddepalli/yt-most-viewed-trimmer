@@ -314,7 +314,12 @@ with st.sidebar:
     if active_ffmpeg:
         st.success(f"✅ FFmpeg active: `{Path(active_ffmpeg).name}`")
     else:
-        st.warning("⚠️ FFmpeg binary not found")
+        st.error("⚠️ FFmpeg binary not found")
+        st.caption(
+            "💡 **To install FFmpeg on Streamlit Cloud:**\n"
+            "Click **'Manage app'** (bottom-right) ➔ **'⋮' (three dots)** ➔ **'Reboot app'** "
+            "so the container builds with `packages.txt`."
+        )
 
     if st.button("🗑️ Clear Temporary Workspace", **STRETCH_WIDTH):
         ws = Path(st.session_state["workspace_dir"])

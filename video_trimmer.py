@@ -34,31 +34,21 @@ def is_ffmpeg_executable(path: Optional[str]) -> bool:
 
 
 def get_ffmpeg_path() -> Optional[str]:
-    """Find a verified working ffmpeg executable from PATH, static-ffmpeg, imageio-ffmpeg, or standard paths."""
-    # 0. Try static_ffmpeg if available
-    try:
-        import static_ffmpeg
-        static_ffmpeg.add_paths()
-    except Exception:
-        pass
-
-    # 1. System PATH
-    exe = shutil.which("ffmpeg")
-    if exe and is_ffmpeg_executable(exe):
-        return exe
-
-    # 2. Standard system locations
-    for loc in [
+    """Find a verified working ffmpeg executable from system, imageio-ffmpeg, or static-ffmpeg."""
+    # 1. Check system PATH and standard Linux/Mac paths FIRST (fastest, 0ms)
+    candidates = [
+        shutil.which("ffmpeg"),
         "/usr/bin/ffmpeg",
         "/usr/local/bin/ffmpeg",
         "/opt/homebrew/bin/ffmpeg",
         "/home/appuser/.local/bin/ffmpeg",
         "/app/.bin/ffmpeg",
-    ]:
-        if os.path.exists(loc) and is_ffmpeg_executable(loc):
+    ]
+    for loc in candidates:
+        if loc and os.path.exists(loc) and is_ffmpeg_executable(loc):
             return loc
 
-    # 3. imageio_ffmpeg (directly check and ensure execute permission on binary)
+    # 2. Check imageio_ffmpeg (directly check and ensure execute permission on binary)
     try:
         import imageio_ffmpeg
         bin_dir = Path(imageio_ffmpeg.__file__).resolve().parent / "binaries"
@@ -82,6 +72,16 @@ def get_ffmpeg_path() -> Optional[str]:
     except Exception:
         pass
 
+    # 3. Check static_ffmpeg as fallback (weak=True: only if not already on path)
+    try:
+        import static_ffmpeg
+        static_ffmpeg.add_paths(weak=True)
+        exe = shutil.which("ffmpeg")
+        if exe and is_ffmpeg_executable(exe):
+            return exe
+    except Exception:
+        pass
+
     return None
 
 
@@ -100,6 +100,10 @@ def ensure_ffmpeg() -> Optional[str]:
     cur_path = os.environ.get("PATH", "")
     if exe_dir not in cur_path.split(os.pathsep):
         os.environ["PATH"] = f"{exe_dir}{os.pathsep}{cur_path}"
+
+    # If exe is already named 'ffmpeg', we're good
+    if Path(exe).name == "ffmpeg":
+        return exe
 
     # Create a guaranteed standard 'ffmpeg' binary shim in tempdir (always writable on Linux)
     import tempfile
