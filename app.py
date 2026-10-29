@@ -1,6 +1,6 @@
 """
 Streamlit Frontend Application:
-YouTube Most-Viewed Timestamp Extractor & Video Trimmer
+YouTube Most-Viewed Timestamp Extractor, Video Trimmer & Aspect-Ratio Cropper
 """
 
 import os
@@ -19,7 +19,7 @@ except Exception:
 import shutil
 import tempfile
 import inspect
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import pandas as pd
 import plotly.graph_objects as go
@@ -51,6 +51,11 @@ from yt_processor import (
 )
 try:
     from video_trimmer import (
+        CROP_PRESETS,
+        CropConfig,
+        build_crop_vf_filter,
+        compute_crop_box_normalized,
+        get_video_dimensions,
         has_ffmpeg,
         ensure_ffmpeg,
         get_ffmpeg_diagnostics,
@@ -63,10 +68,14 @@ try:
     )
 except ImportError:
     import importlib
-    import sys
     if "video_trimmer" in sys.modules:
         importlib.reload(sys.modules["video_trimmer"])
     from video_trimmer import (
+        CROP_PRESETS,
+        CropConfig,
+        build_crop_vf_filter,
+        compute_crop_box_normalized,
+        get_video_dimensions,
         has_ffmpeg,
         ensure_ffmpeg,
         get_ffmpeg_diagnostics,
@@ -89,7 +98,7 @@ STRETCH_WIDTH = (
 # Page Configuration & Styling
 # ------------------------------------------------------------------------------
 st.set_page_config(
-    page_title="YT Most-Viewed Timestamp Trimmer",
+    page_title="YT Most-Viewed Timestamp Trimmer & Cropper",
     page_icon="🎬",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -120,6 +129,14 @@ st.markdown(
         border-radius: 999px;
         font-size: 0.78rem;
     }
+    .crop-badge {
+        background-color: #0F5132;
+        color: #75B798;
+        padding: 3px 10px;
+        border-radius: 999px;
+        font-weight: 600;
+        font-size: 0.78rem;
+    }
     </style>
     """,
     unsafe_allow_html=True,
@@ -136,6 +153,7 @@ def init_session_state():
         "segments": [],
         "source_video_path": None,
         "trimmed_clips": {},       # rank -> Path
+        "raw_clips": {},           # rank -> uncropped Path (for instant re-cropping)
         "all_clips_zip_path": None,
         "workspace_dir": tempfile.mkdtemp(prefix="yt_trimmer_"),
     }
@@ -155,7 +173,7 @@ init_session_state()
 
 
 # ------------------------------------------------------------------------------
-# Helper: Interactive Heatmap Chart
+# Helper: Interactive Heatmap Chart & Visual Crop Preview
 # ------------------------------------------------------------------------------
 def build_heatmap_figure(heatmap: List[Dict[str, float]], segments: List[HighlightSegment]) -> go.Figure:
     """Create a Plotly area chart showing the YouTube Most Replayed curve and extracted peak windows."""
@@ -180,7 +198,6 @@ def build_heatmap_figure(heatmap: List[Dict[str, float]], segments: List[Highlig
             )
         )
 
-    # Highlight extracted segments as shaded vertical rectangles
     colors = [
         "rgba(0, 212, 170, 0.28)",
         "rgba(255, 193, 7, 0.25)",
@@ -213,6 +230,60 @@ def build_heatmap_figure(heatmap: List[Dict[str, float]], segments: List[Highlig
         hovermode="x unified",
     )
     return fig
+
+
+def render_crop_framing_preview(crop_cfg: CropConfig, thumb_url: Optional[str] = None):
+    """Render a live CSS visual framing overlay showing the active crop region on a 16:9 canvas."""
+    if not crop_cfg.is_active:
+        return
+
+    if crop_cfg.mode == "9:16_blur":
+        st.caption("✨ **Crop Preview:** Full 16:9 frame centered inside a 9:16 vertical canvas with blurred background.")
+        return
+
+    x0, y0, x1, y1 = compute_crop_box_normalized(crop_cfg, source_aspect=16.0 / 9.0)
+    left_pct = round(x0 * 100, 1)
+    top_pct = round(y0 * 100, 1)
+    width_pct = round((x1 - x0) * 100, 1)
+    height_pct = round((y1 - y0) * 100, 1)
+
+    bg_style = (
+        f"background-image: url('{thumb_url}'); background-size: cover; background-position: center;"
+        if thumb_url
+        else "background: linear-gradient(135deg, #1E293B 0%, #334155 100%);"
+    )
+
+    html = f"""
+    <div style="margin-top:6px; margin-bottom:10px;">
+        <div style="font-size:0.80rem; color:#94A3B8; margin-bottom:4px;">
+            📐 <b>Active Crop Window:</b> {CROP_PRESETS.get(crop_cfg.mode, crop_cfg.mode)}
+            ({width_pct:.0f}% W × {height_pct:.0f}% H)
+        </div>
+        <div style="position:relative; width:100%; aspect-ratio:16/9; border-radius:8px; overflow:hidden; border:1px solid #334155; {bg_style}">
+            <div style="position:absolute; inset:0; background:rgba(0,0,0,0.62);"></div>
+            <div style="
+                position:absolute;
+                left:{left_pct}%;
+                top:{top_pct}%;
+                width:{width_pct}%;
+                height:{height_pct}%;
+                border:2px solid #00D4AA;
+                box-shadow: 0 0 0 9999px rgba(0, 0, 0, 0.45);
+                background:rgba(0, 212, 170, 0.12);
+                display:flex;
+                align-items:center;
+                justify-content:center;
+                color:#FFFFFF;
+                font-weight:700;
+                font-size:0.78rem;
+                text-shadow:0 1px 3px rgba(0,0,0,0.9);
+            ">
+                {crop_cfg.mode.upper()}
+            </div>
+        </div>
+    </div>
+    """
+    st.markdown(html, unsafe_allow_html=True)
 
 
 # ------------------------------------------------------------------------------
@@ -262,10 +333,77 @@ with st.sidebar:
         help="Extra lead-in and lead-out seconds added around each detected peak.",
     )
 
+    # --------------------------------------------------------------------------
+    # NEW: Video Cropping & Framing Section
+    # --------------------------------------------------------------------------
     st.divider()
-    st.subheader("🎞️ Video Output Settings")
+    st.subheader("📐 Video Cropping & Framing")
+
+    crop_mode_key = st.selectbox(
+        "Aspect Ratio / Crop Mode",
+        options=list(CROP_PRESETS.keys()),
+        index=0,
+        format_func=lambda k: CROP_PRESETS[k],
+        help="Crop horizontal 16:9 videos into vertical 9:16 (Shorts/Reels/TikTok), 1:1 Square, 4:5 Portrait, or custom margins.",
+    )
+
+    pan_x_val = 0.5
+    pan_y_val = 0.5
+    custom_left = 0.0
+    custom_right = 0.0
+    custom_top = 0.0
+    custom_bottom = 0.0
+
+    if crop_mode_key in ("9:16", "1:1", "4:5", "4:3"):
+        focus_choice = st.radio(
+            "Subject Focus / Horizontal Position",
+            options=["🎯 Center (50%)", "⬅️ Left Subject (20%)", "➡️ Right Subject (80%)", "🎚️ Custom Pan (%)"],
+            index=0,
+            horizontal=False,
+            help="Choose which part of the widescreen frame to keep inside the cropped video.",
+        )
+        if "Left" in focus_choice:
+            pan_x_val = 0.20
+        elif "Right" in focus_choice:
+            pan_x_val = 0.80
+        elif "Custom" in focus_choice:
+            pan_x_pct = st.slider("Horizontal Pan (0% = Left, 100% = Right)", 0, 100, 50, 1)
+            pan_y_pct = st.slider("Vertical Pan (0% = Top, 100% = Bottom)", 0, 100, 50, 1)
+            pan_x_val = pan_x_pct / 100.0
+            pan_y_val = pan_y_pct / 100.0
+
+    elif crop_mode_key == "custom":
+        st.caption("Set percentage of frame to crop off from each edge (0%–45%):")
+        cc1, cc2 = st.columns(2)
+        with cc1:
+            custom_left = float(st.slider("Left Crop (%)", 0, 45, 15, 1))
+            custom_top = float(st.slider("Top Crop (%)", 0, 45, 0, 1))
+        with cc2:
+            custom_right = float(st.slider("Right Crop (%)", 0, 45, 15, 1))
+            custom_bottom = float(st.slider("Bottom Crop (%)", 0, 45, 0, 1))
+
+    active_crop_config = CropConfig(
+        mode=crop_mode_key,
+        pan_x=pan_x_val,
+        pan_y=pan_y_val,
+        left_pct=custom_left,
+        right_pct=custom_right,
+        top_pct=custom_top,
+        bottom_pct=custom_bottom,
+    )
 
     info_loaded = st.session_state.get("video_info")
+    if active_crop_config.is_active:
+        render_crop_framing_preview(
+            active_crop_config,
+            thumb_url=info_loaded.get("thumbnail") if isinstance(info_loaded, dict) else None,
+        )
+
+    # --------------------------------------------------------------------------
+    # Video Output Settings
+    # --------------------------------------------------------------------------
+    st.divider()
+    st.subheader("🎞️ Video Output Settings")
 
     def _res_label(r: int) -> str:
         if info_loaded:
@@ -292,8 +430,11 @@ with st.sidebar:
     fast_copy_mode = st.checkbox(
         "Fast Stream Copy (No Re-encode)",
         value=False,
-        help="Uses FFmpeg `-c copy` for instant trimming. Uncheck for frame-accurate H.264 re-encoding.",
+        disabled=active_crop_config.is_active,
+        help="Uses FFmpeg `-c copy` for instant trimming. Disabled automatically when video cropping is active (cropping requires H.264 filter encoding).",
     )
+    if active_crop_config.is_active:
+        st.caption("ℹ️ *Cropping is enabled — clips will be encoded with H.264 (`libx264`) to apply the crop filter.*")
 
     trim_strategy = st.radio(
         "Trimming Strategy",
@@ -309,7 +450,7 @@ with st.sidebar:
     with st.expander(f"🍪 YouTube Cookies / Bot Bypass {badge}", expanded=not has_active_cookies):
         st.caption(
             "Cloud servers (Streamlit Cloud, AWS) are flagged by YouTube's bot detection. "
-            "Pasting your `cookies.txt` here saves it persistently on this server so you never have to paste again."
+            "Paste your `cookies.txt` (Netscape or JSON format) here to save it on this server."
         )
         cookie_text = st.text_area(
             "Paste cookies.txt content",
@@ -317,7 +458,7 @@ with st.sidebar:
             placeholder="# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t...\t...",
             height=120,
             key="cookie_textarea_box",
-            help="Export cookies from your browser using an extension like 'Get cookies.txt LOCALLY'.",
+            help="Export cookies from your browser using 'Get cookies.txt LOCALLY' or 'Cookie-Editor'.",
         )
         if cookie_text.strip() and cookie_text.strip() != st.session_state.get("youtube_cookies_text", ""):
             sanitized = sanitize_cookie_content(cookie_text.strip())
@@ -337,9 +478,11 @@ with st.sidebar:
                 for f in ["user_cookies.txt", "cookies.txt"]:
                     if Path(f).exists():
                         Path(f).unlink()
-                env_f = Path(tempfile.gettempdir()) / "env_cookies.txt"
-                if env_f.exists():
-                    env_f.unlink()
+                for tmp_f in Path(tempfile.gettempdir()).glob("*cookies*.txt"):
+                    try:
+                        tmp_f.unlink()
+                    except Exception:
+                        pass
                 st.session_state["youtube_cookies_text"] = ""
                 st.rerun()
 
@@ -362,6 +505,7 @@ with st.sidebar:
         st.session_state["segments"] = []
         st.session_state["source_video_path"] = None
         st.session_state["trimmed_clips"] = {}
+        st.session_state["raw_clips"] = {}
         st.session_state["all_clips_zip_path"] = None
         st.rerun()
 
@@ -369,11 +513,12 @@ with st.sidebar:
 # ------------------------------------------------------------------------------
 # Main Header & URL Input
 # ------------------------------------------------------------------------------
-st.title("🎬 YouTube Most-Viewed Timestamp Extractor & Video Trimmer")
+st.title("🎬 YouTube Most-Viewed Timestamp Extractor, Trimmer & Cropper")
 st.caption(
     "Load any YouTube video link, automatically detect its highest-replayed timestamp peaks "
     "(via YouTube's heatmap telemetry, with automatic fallback to chapters/timestamps), "
-    "and trim either all highlights or any particular segment for instant preview and download."
+    "crop to 9:16 Vertical (Shorts/Reels), 1:1 Square, 4:5 Portrait, or custom margins, "
+    "and download any particular clip or all clips in a ZIP archive."
 )
 
 url_col, btn_col, demo_col = st.columns([6, 2, 2])
@@ -391,17 +536,15 @@ with demo_col:
 
 active_cookie_file = get_yt_cookies_file()
 if not active_cookie_file:
-    with st.expander("🔑 YouTube Authentication (Required for Cloud Hosting)", expanded=True):
-        st.warning(
-            "⚠️ **No YouTube cookies detected**: YouTube blocks cloud servers (Streamlit Cloud, AWS) from streaming video formats without authentication.\n\n"
-            "**To enable video trimming:**\n"
-            "1. Export your YouTube cookies using the free Chrome extension **Get cookies.txt LOCALLY**.\n"
-            "2. Paste the cookie text below and click **Save & Authenticate** (or add `YOUTUBE_COOKIES` in Streamlit Cloud Secrets)."
+    with st.expander("🔑 YouTube Authentication (Optional — Helpful for Age/Bot-Restricted Videos on Cloud)", expanded=False):
+        st.info(
+            "💡 **Cloud Bot-Bypass Built-In**: This app automatically rotates across `ANDROID_VR`, `IOS`, `TV`, and `WEB_SAFARI` clients plus a secondary `pytubefix` engine. "
+            "If a specific video still requires login on Streamlit Cloud, paste your exported YouTube `cookies.txt` below."
         )
         main_cookie_text = st.text_area(
             "Paste cookies.txt content here",
             placeholder="# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t...\t...",
-            height=110,
+            height=100,
             key="main_cookie_box",
         )
         if st.button("💾 Save & Authenticate Cookies", type="primary", key="save_main_cookie_btn"):
@@ -412,21 +555,19 @@ if not active_cookie_file:
                 st.success("✅ Cookies saved and activated! You can now trim videos.")
                 st.rerun()
 else:
-    st.caption("✅ **YouTube Authenticated** (Cookies active on server)")
+    st.caption("✅ **YouTube Authenticated** (Isolated working cookie jar active on server)")
 
 
 # ------------------------------------------------------------------------------
 # Handle Demo Mode or Live URL Extraction
 # ------------------------------------------------------------------------------
 if demo_clicked:
-    # Populate a synthetic demo video with realistic heatmap data so users can test UI immediately
     import math
     demo_duration = 300.0
     demo_heatmap = []
     for i in range(100):
         t0 = i * 3.0
         t1 = (i + 1) * 3.0
-        # Create 4 pronounced peaks at 42s, 115s, 195s, 255s
         val = (
             0.15
             + 0.83 * math.exp(-((t0 - 42.0) ** 2) / 120.0)
@@ -458,6 +599,7 @@ if demo_clicked:
         padding_seconds=float(padding_sec),
     )
     st.session_state["trimmed_clips"] = {}
+    st.session_state["raw_clips"] = {}
     st.session_state["all_clips_zip_path"] = None
 
 if analyze_clicked:
@@ -471,6 +613,7 @@ if analyze_clicked:
                 st.session_state["video_info"] = info
                 st.session_state["source_video_path"] = None
                 st.session_state["trimmed_clips"] = {}
+                st.session_state["raw_clips"] = {}
                 st.session_state["all_clips_zip_path"] = None
 
                 heatmap = info.get("heatmap")
@@ -524,7 +667,9 @@ if info:
 
     with meta_col1:
         thumb_url = info.get("thumbnail")
-        if thumb_url:
+        if active_crop_config.is_active:
+            render_crop_framing_preview(active_crop_config, thumb_url=thumb_url)
+        elif thumb_url:
             st.image(thumb_url, **STRETCH_WIDTH)
         if st.session_state.get("video_url"):
             st.video(st.session_state["video_url"])
@@ -561,7 +706,6 @@ if info:
                 "Segments below were extracted using video chapters / description timestamps fallback."
             )
 
-        # Render interactive Plotly curve
         fig = build_heatmap_figure(info.get("heatmap") or [], segments)
         st.plotly_chart(fig, **STRETCH_WIDTH)
 
@@ -589,27 +733,35 @@ if info:
                 "Peak Moment": format_timestamp(seg.peak_time),
                 "Duration (s)": f"{seg.duration:.1f}s",
                 "Est. Clip Size": c_sz_str,
+                "Crop Mode": CROP_PRESETS.get(active_crop_config.mode, "Original"),
                 "Replay Intensity": f"{int(round(seg.score * 100))}%",
                 "Source": seg.source,
             })
         st.dataframe(pd.DataFrame(df_rows), hide_index=True, **STRETCH_WIDTH)
 
         # Action toolbar: Trim All vs Trim Particular Segment
-        st.markdown("### ✂️ Trim & Download Video Segments")
+        st.markdown("### ✂️ Trim, Crop & Download Video Segments")
 
         total_clips_est = sum(
             estimate_clip_size(seg.duration, duration, source_size_bytes)
             for seg in segments
         )
+        crop_summary_badge = (
+            f" &nbsp;|&nbsp; 📐 **Active Crop:** `{CROP_PRESETS.get(active_crop_config.mode)}`"
+            if active_crop_config.is_active
+            else " &nbsp;|&nbsp; 🖥️ **Aspect Ratio:** `Original (No Crop)`"
+        )
         if is_src_downloaded:
             st.info(
                 f"💾 **Source video cached:** `{format_bytes(source_size_bytes)}` &nbsp;|&nbsp; "
                 f"🎬 **Estimated highlights total:** `~{format_bytes(total_clips_est)}` ({len(segments)} clips)"
+                f"{crop_summary_badge}"
             )
         else:
             st.info(
                 f"📥 **Estimated full video download:** `~{format_bytes(source_size_bytes)}` ({max_resolution}p) &nbsp;|&nbsp; "
                 f"🎬 **Estimated highlights total:** `~{format_bytes(total_clips_est)}` ({len(segments)} clips)"
+                f"{crop_summary_badge}"
             )
 
         act_col1, act_col2, act_col3 = st.columns([2.5, 2.5, 2.2])
@@ -688,7 +840,6 @@ if info:
                 return Path(existing)
 
             if info.get("is_demo"):
-                # Generate a synthetic demo MP4 with FFmpeg testsrc so Demo Mode works offline too
                 demo_mp4 = ws / "demo_source.mp4"
                 if not demo_mp4.exists() and has_ffmpeg():
                     import subprocess
@@ -723,20 +874,44 @@ if info:
         def show_trim_error(prefix: str, exc: Exception):
             clean_msg = strip_ansi(str(exc))
             st.error(f"{prefix}: {clean_msg}")
-            if any(term in clean_msg.lower() for term in ["bytes read", "nodename nor servname", "connection", "timeout", "incomplete"]):
+            if "403" in clean_msg or "bot" in clean_msg.lower() or "sign in" in clean_msg.lower():
                 st.warning(
-                    "💡 **Connection Interrupted**: YouTube dropped the streaming connection before the video finished downloading. "
-                    "Resuming is enabled — **click Trim again to continue from where it stopped**, or select **480p / 360p** in the sidebar for a much faster download."
+                    "🔒 **YouTube Cloud Datacenter Restriction (HTTP 403)**: "
+                    "Try exporting a fresh `cookies.txt` from an incognito/new browser tab while logged into YouTube and pasting it into **🍪 YouTube Cookies / Bot Bypass** in the sidebar, or switch resolution to **480p / 360p**."
                 )
 
         def trim_single_segment_smart(target_seg: HighlightSegment):
             ws = Path(st.session_state["workspace_dir"])
             clips_dir = ws / "trimmed_clips"
+            raw_dir = ws / "raw_clips_cache"
             clips_dir.mkdir(parents=True, exist_ok=True)
+            raw_dir.mkdir(parents=True, exist_ok=True)
+
             existing_src = st.session_state.get("source_video_path")
             has_src = bool(existing_src and Path(existing_src).exists())
+            cached_raw = st.session_state.get("raw_clips", {}).get(target_seg.rank)
+            has_cached_raw = bool(cached_raw and Path(cached_raw).exists() and Path(cached_raw).stat().st_size > 0)
 
-            if has_src or info.get("is_demo") or not is_direct_stream_trim:
+            safe_title = sanitize_filename(info.get("title", "video"))
+            start_tag = format_timestamp(target_seg.start_time).replace(":", "m") + "s"
+            end_tag = format_timestamp(target_seg.end_time).replace(":", "m") + "s"
+            crop_tag = active_crop_config.file_tag if active_crop_config else ""
+            clip_filename = f"{safe_title}_rank{target_seg.rank}_{start_tag}_to_{end_tag}{crop_tag}.mp4"
+            clip_path = clips_dir / clip_filename
+
+            # 1. If we already have the uncropped raw clip cached locally, crop/copy from it in <1s without network!
+            if has_cached_raw and not has_src:
+                with st.spinner(f"Applying crop ({active_crop_config.mode}) to cached Clip #{target_seg.rank}..."):
+                    trim_clip_ffmpeg(
+                        source_video=Path(cached_raw),
+                        output_path=clip_path,
+                        start_time=0.0,
+                        end_time=target_seg.duration + 5.0,
+                        fast_copy=not active_crop_config.is_active,
+                        crop_config=active_crop_config,
+                    )
+                    trimmed_map = {target_seg.rank: clip_path}
+            elif has_src or info.get("is_demo") or not is_direct_stream_trim:
                 src_path = ensure_source_video()
                 with st.spinner(f"Trimming Clip #{target_seg.rank} ({target_seg.time_range_str})..."):
                     trimmed_map = trim_selected_segments(
@@ -745,32 +920,39 @@ if info:
                         clips_dir=clips_dir,
                         video_title=info.get("title", "video"),
                         fast_copy=fast_copy_mode,
+                        crop_config=active_crop_config,
                     )
             else:
-                # Direct Stream-Trim: download ONLY the ~10-15 MB clip from YouTube
-                safe_title = sanitize_filename(info.get("title", "video"))
-                start_tag = format_timestamp(target_seg.start_time).replace(":", "m") + "s"
-                end_tag = format_timestamp(target_seg.end_time).replace(":", "m") + "s"
-                clip_filename = f"{safe_title}_rank{target_seg.rank}_{start_tag}_to_{end_tag}.mp4"
-                clip_path = clips_dir / clip_filename
+                raw_clip_path = raw_dir / f"{safe_title}_rank{target_seg.rank}_{start_tag}_to_{end_tag}_raw.mp4"
                 prog_bar = st.progress(0.0, text=f"Direct streaming clip #{target_seg.rank} ({target_seg.time_range_str})...")
-
                 try:
                     download_single_clip_section(
                         url=st.session_state["video_url"],
-                        output_path=clip_path,
+                        output_path=raw_clip_path,
                         start_time=target_seg.start_time,
                         end_time=target_seg.end_time,
                         max_height=max_resolution,
+                        crop_config=None,
                         progress_callback=lambda p, msg: prog_bar.progress(p, text=msg),
                     )
                     prog_bar.empty()
+                    st.session_state["raw_clips"][target_seg.rank] = raw_clip_path
+                    if active_crop_config.is_active:
+                        with st.spinner(f"Applying {active_crop_config.mode} crop to Clip #{target_seg.rank}..."):
+                            trim_clip_ffmpeg(
+                                source_video=raw_clip_path,
+                                output_path=clip_path,
+                                start_time=0.0,
+                                end_time=target_seg.duration + 5.0,
+                                fast_copy=False,
+                                crop_config=active_crop_config,
+                            )
+                    else:
+                        shutil.copy2(raw_clip_path, clip_path)
                     trimmed_map = {target_seg.rank: clip_path}
-                except Exception as exc:
+                except Exception:
                     prog_bar.empty()
-                    st.warning(f"ℹ️ Direct stream note: {strip_ansi(str(exc))[:220]}")
-                    # Fallback to full download if stream slice fails
-                    st.info("Direct stream slice fallback: downloading source video...")
+                    st.info("Switching to full video stream download fallback...")
                     src_path = ensure_source_video()
                     trimmed_map = trim_selected_segments(
                         source_video=src_path,
@@ -778,6 +960,7 @@ if info:
                         clips_dir=clips_dir,
                         video_title=info.get("title", "video"),
                         fast_copy=fast_copy_mode,
+                        crop_config=active_crop_config,
                     )
 
             st.session_state["trimmed_clips"].update(trimmed_map)
@@ -804,12 +987,13 @@ if info:
                             clips_dir=clips_dir,
                             video_title=info.get("title", "video"),
                             max_height=max_resolution,
+                            crop_config=active_crop_config,
                             progress_callback=_on_trim_prog,
                         )
                         prog.empty()
-                    except Exception as exc:
+                    except Exception:
                         prog.empty()
-                        st.info("Direct stream fallback: downloading source video...")
+                        st.info("Switching to full video stream download fallback...")
                         src_path = ensure_source_video()
                         trimmed_map = trim_selected_segments(
                             source_video=src_path,
@@ -817,6 +1001,7 @@ if info:
                             clips_dir=clips_dir,
                             video_title=info.get("title", "video"),
                             fast_copy=fast_copy_mode,
+                            crop_config=active_crop_config,
                             progress_callback=_on_trim_prog,
                         )
                 else:
@@ -830,6 +1015,7 @@ if info:
                         clips_dir=clips_dir,
                         video_title=info.get("title", "video"),
                         fast_copy=fast_copy_mode,
+                        crop_config=active_crop_config,
                         progress_callback=_on_trim_prog,
                     )
                     prog.empty()
@@ -870,7 +1056,7 @@ if info:
                     **STRETCH_WIDTH,
                 )
 
-        st.markdown("#### 🎞️ Individual Highlight Segments (Preview & Download Particular Clip)")
+        st.markdown("#### 🎞️ Individual Highlight Segments (Preview, Crop & Download Particular Clip)")
         grid_cols = st.columns(2)
 
         for idx, seg in enumerate(segments):
@@ -885,6 +1071,14 @@ if info:
                     est_clip_sz = estimate_clip_size(seg.duration, duration, source_size_bytes)
                     size_badge_html = f"<b>Est. Size:</b> ~{format_bytes(est_clip_sz)}"
 
+                dims = get_video_dimensions(Path(clip_file)) if is_trimmed else None
+                dims_str = f" ({dims[0]}×{dims[1]})" if dims else ""
+                crop_pill = (
+                    f"&nbsp;|&nbsp; <span class='crop-badge'>📐 {active_crop_config.mode}{dims_str}</span>"
+                    if (active_crop_config.is_active or dims)
+                    else ""
+                )
+
                 st.markdown(
                     f"""
                     <div class="clip-card">
@@ -897,6 +1091,7 @@ if info:
                             <b>Duration:</b> {seg.duration:.1f}s &nbsp;|&nbsp;
                             {size_badge_html} &nbsp;|&nbsp;
                             <span class="source-badge">{seg.source}</span>
+                            {crop_pill}
                         </div>
                     </div>
                     """,
@@ -906,20 +1101,35 @@ if info:
                 if is_trimmed:
                     st.video(str(clip_file))
                     actual_sz_str = format_bytes(Path(clip_file).stat().st_size)
-                    with open(clip_file, "rb") as f_mp4:
-                        st.download_button(
-                            label=f"⬇️ Download Clip #{seg.rank} ({seg.time_range_str} — {actual_sz_str})",
-                            data=f_mp4.read(),
-                            file_name=Path(clip_file).name,
-                            mime="video/mp4",
-                            key=f"dl_btn_{seg.rank}",
+                    dl_col, recrop_col = st.columns([2, 1.3])
+                    with dl_col:
+                        with open(clip_file, "rb") as f_mp4:
+                            st.download_button(
+                                label=f"⬇️ Download Clip #{seg.rank} ({actual_sz_str})",
+                                data=f_mp4.read(),
+                                file_name=Path(clip_file).name,
+                                mime="video/mp4",
+                                key=f"dl_btn_{seg.rank}",
+                                **STRETCH_WIDTH,
+                            )
+                    with recrop_col:
+                        if st.button(
+                            f"🔄 Re-Trim / Apply Crop",
+                            key=f"recrop_btn_{seg.rank}",
+                            help="Re-trim or apply the current sidebar Crop settings to this clip.",
                             **STRETCH_WIDTH,
-                        )
+                        ):
+                            try:
+                                trim_single_segment_smart(seg)
+                                st.rerun()
+                            except Exception as exc:
+                                show_trim_error(f"Error re-cropping Clip #{seg.rank}", exc)
                 else:
                     est_clip_sz = estimate_clip_size(seg.duration, duration, source_size_bytes)
                     est_sz_str = format_bytes(est_clip_sz)
+                    crop_btn_note = f" [{active_crop_config.mode}]" if active_crop_config.is_active else ""
                     if st.button(
-                        f"✂️ Trim & Prepare Clip #{seg.rank} ({seg.time_range_str} — ~{est_sz_str})",
+                        f"✂️ Trim & Prepare Clip #{seg.rank}{crop_btn_note} ({seg.time_range_str} — ~{est_sz_str})",
                         key=f"inline_trim_{seg.rank}",
                         **STRETCH_WIDTH,
                     ):

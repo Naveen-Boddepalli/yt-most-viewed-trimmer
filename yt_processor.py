@@ -10,7 +10,7 @@ _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from utils import format_timestamp
+from utils import format_timestamp, get_yt_cookies_file
 
 
 @dataclass
@@ -40,48 +40,101 @@ class HighlightSegment:
 
 
 def fetch_video_metadata(url: str, cookies_file: Optional[str] = None) -> Dict[str, Any]:
-    """Fetch video metadata (including heatmap and chapters) without downloading the video."""
+    """
+    Fetch video metadata (including heatmap and chapters) without downloading the video.
+    Tries multiple client profiles (with and without cookies) so heatmap data is
+    retrieved reliably on Streamlit Cloud / datacenter IPs.
+    """
     import yt_dlp
-    from utils import get_yt_cookies_file
 
-    if not cookies_file:
-        cookies_file = get_yt_cookies_file()
+    # Always obtain a fresh working cookie copy if available
+    active_cookies = cookies_file or get_yt_cookies_file()
 
-    ydl_opts: Dict[str, Any] = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "extract_flat": False,
-        "ignore_no_formats_error": True,
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["visionos", "web", "mweb"],
-            }
+    # Note: 'web' and 'mweb' return YouTube's 'heatmap' (Most Replayed) array.
+    # Try cookie-authenticated web/mweb first, then cookieless web/visionos/android_vr,
+    # then tv/embedded fallback.
+    attempts = []
+    if active_cookies and Path(active_cookies).exists():
+        attempts.append({
+            "use_cookies": True,
+            "clients": ["web", "mweb", "tv"],
+        })
+    attempts.extend([
+        {
+            "use_cookies": False,
+            "clients": ["web", "mweb", "visionos"],
         },
-    }
+        {
+            "use_cookies": False,
+            "clients": ["android_vr", "ios", "tv_embedded"],
+        },
+        {
+            "use_cookies": True if (active_cookies and Path(active_cookies).exists()) else False,
+            "clients": ["tv_embedded", "web_creator", "mediaconnect"],
+        },
+    ])
 
-    if cookies_file and Path(cookies_file).exists():
-        ydl_opts["cookiefile"] = str(cookies_file)
-
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            return ydl.extract_info(url, download=False)
-    except Exception as exc:
-        err_msg = str(exc).lower()
-        if "confirm you're not a bot" in err_msg or "sign in" in err_msg:
-            # Fallback client attempt with alternative clients
-            alt_opts = dict(ydl_opts)
-            alt_opts["extractor_args"] = {
+    last_exc: Optional[Exception] = None
+    for attempt in attempts:
+        ydl_opts: Dict[str, Any] = {
+            "quiet": True,
+            "no_warnings": True,
+            "skip_download": True,
+            "extract_flat": False,
+            "ignore_no_formats_error": True,
+            "cachedir": False,
+            "socket_timeout": 25,
+            "extractor_args": {
                 "youtube": {
-                    "player_client": ["tv_embedded", "android", "ios"],
+                    "player_client": attempt["clients"],
                 }
-            }
-            try:
-                with yt_dlp.YoutubeDL(alt_opts) as ydl:
-                    return ydl.extract_info(url, download=False)
-            except Exception:
-                raise exc
-        raise exc
+            },
+        }
+        if attempt["use_cookies"]:
+            fresh_cf = cookies_file or get_yt_cookies_file()
+            if fresh_cf and Path(fresh_cf).exists():
+                ydl_opts["cookiefile"] = str(fresh_cf)
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                if info and isinstance(info, dict) and (info.get("duration") or info.get("title")):
+                    return info
+        except Exception as exc:
+            last_exc = exc
+            continue
+
+    # Final fallback: try pytubefix metadata if yt-dlp is completely blocked
+    try:
+        from pytubefix import YouTube
+        yt = YouTube(url, client="ANDROID_VR")
+        chapters_list = []
+        if getattr(yt, "chapters", None):
+            for ch in yt.chapters:
+                st_sec = float(getattr(ch, "start_seconds", 0.0))
+                dur_sec = float(getattr(ch, "duration", 20.0))
+                chapters_list.append({
+                    "start_time": st_sec,
+                    "end_time": st_sec + dur_sec,
+                    "title": getattr(ch, "title", "Chapter"),
+                })
+        return {
+            "id": yt.video_id,
+            "title": yt.title or "YouTube Video",
+            "uploader": yt.author or "YouTube Channel",
+            "duration": float(yt.length or 0.0),
+            "view_count": int(yt.views or 0),
+            "thumbnail": yt.thumbnail_url,
+            "description": yt.description or "",
+            "chapters": chapters_list,
+            "heatmap": None,
+        }
+    except Exception:
+        pass
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("Unable to fetch YouTube video metadata.")
 
 
 def estimate_video_size(info: Optional[Dict[str, Any]], max_height: int = 720) -> int:
@@ -164,7 +217,6 @@ def estimate_video_size(info: Optional[Dict[str, Any]], max_height: int = 720) -
         return int(info["filesize_approx"])
 
     if duration > 0:
-        # Standard average video+audio bitrates (bps) for web video (H.264 + AAC)
         bitrate_map = {
             360: 750_000,
             480: 1_250_000,
@@ -182,7 +234,6 @@ def estimate_clip_size(clip_duration: float, total_duration: float, total_size_b
     Estimate clip file size proportionally based on segment duration and full video size.
     """
     if total_duration <= 0 or total_size_bytes <= 0:
-        # Fallback estimation based on typical 720p 2.6 Mbps bitrate
         return int((2_600_000 / 8) * max(0.0, clip_duration))
     ratio = max(0.0, clip_duration) / total_duration
     return int(total_size_bytes * ratio)
@@ -216,7 +267,6 @@ def extract_most_viewed_segments(
     bins = sorted(heatmap, key=lambda b: float(b.get("start_time", 0.0)))
     n = len(bins)
 
-    # Identify local maxima across the heatmap curve
     candidate_indices = []
     for i in range(n):
         val = float(bins[i].get("value", 0.0))
@@ -228,7 +278,6 @@ def extract_most_viewed_segments(
     if not candidate_indices:
         candidate_indices = list(range(n))
 
-    # Sort local maxima by score descending
     candidate_indices.sort(key=lambda idx: float(bins[idx].get("value", 0.0)), reverse=True)
 
     raw_intervals = []
@@ -241,7 +290,6 @@ def extract_most_viewed_segments(
         if peak_val < min_score_threshold and len(raw_intervals) >= top_k:
             continue
 
-        # Expand left and right while bin value >= max(min_score_threshold, 0.65 * peak_val)
         local_cutoff = max(min_score_threshold * 0.85, peak_val * 0.65)
         left = idx
         while left > 0 and float(bins[left - 1].get("value", 0.0)) >= local_cutoff:
@@ -257,7 +305,6 @@ def extract_most_viewed_segments(
         end_t = min(video_duration, float(bins[right].get("end_time", video_duration)) + padding_seconds)
         peak_t = (float(bins[idx].get("start_time", 0.0)) + float(bins[idx].get("end_time", 0.0))) / 2.0
 
-        # Enforce min and max clip duration centered around the peak
         cur_dur = end_t - start_t
         if cur_dur < min_clip_duration:
             deficit = min_clip_duration - cur_dur
@@ -282,7 +329,6 @@ def extract_most_viewed_segments(
         if len(raw_intervals) >= top_k * 2:
             break
 
-    # Deduplicate / merge overlapping intervals while keeping higher score
     raw_intervals.sort(key=lambda x: x["start_time"])
     merged: List[Dict[str, float]] = []
     for item in raw_intervals:
@@ -291,7 +337,6 @@ def extract_most_viewed_segments(
             continue
         prev = merged[-1]
         if item["start_time"] <= prev["end_time"] + merge_gap_seconds:
-            # Check if merging would exceed max_clip_duration
             combined_dur = max(prev["end_time"], item["end_time"]) - prev["start_time"]
             if combined_dur <= max_clip_duration:
                 prev["end_time"] = max(prev["end_time"], item["end_time"])
@@ -299,17 +344,14 @@ def extract_most_viewed_segments(
                     prev["score"] = item["score"]
                     prev["peak_time"] = item["peak_time"]
             else:
-                # Keep the higher-scoring one or trim overlap
                 if item["score"] > prev["score"]:
                     merged[-1] = item
         else:
             merged.append(item)
 
-    # Sort by replay score descending and pick top_k
     merged.sort(key=lambda x: x["score"], reverse=True)
     top_merged = merged[:top_k]
 
-    # Sort chronologically or keep ranked order (assign rank by score)
     segments: List[HighlightSegment] = []
     for rank_idx, seg in enumerate(top_merged, start=1):
         segments.append(
@@ -341,7 +383,6 @@ def extract_fallback_segments(
     if duration <= 0:
         return []
 
-    # 1. Check chapters
     chapters = info.get("chapters")
     if chapters and isinstance(chapters, list):
         segments = []
@@ -365,7 +406,6 @@ def extract_fallback_segments(
         if segments:
             return segments
 
-    # 2. Check description timestamps
     description = info.get("description") or ""
     ts_matches = re.findall(r"(?:^|\s)(\d{1,2}:\d{2}(?::\d{2})?)\s+([^\n]{3,60})", description)
     if ts_matches:
@@ -390,7 +430,6 @@ def extract_fallback_segments(
         if segments:
             return segments
 
-    # 3. Uniform sampling across the video
     segments = []
     step = duration / (top_k + 1)
     for idx in range(1, top_k + 1):

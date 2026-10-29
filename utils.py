@@ -1,5 +1,6 @@
-"""Utility functions for timestamp formatting, validation, size formatting, and file cleanup."""
+"""Utility functions for timestamp formatting, validation, size formatting, cookie handling, and file cleanup."""
 
+import json
 import os
 import re
 import tempfile
@@ -56,36 +57,65 @@ sanitize_environment()
 def sanitize_cookie_content(content: str) -> str:
     """
     Ensure the cookie content has the proper Netscape HTTP Cookie File format for yt-dlp.
-    1. Removes malformed lines that crash MozillaCookieJar.
-    2. Converts spaces to tabs.
-    3. If a cookie has 6 columns (value is empty), appends an empty string as the 7th column.
-    4. Drops any lines with fewer than 6 columns.
-    5. Preserves valid comments and ensures Netscape header.
+    Supports both Netscape format and JSON cookie exports (e.g. Cookie-Editor / EditThisCookie).
+    1. Converts JSON cookie arrays to Netscape format automatically if detected.
+    2. Removes malformed lines that crash MozillaCookieJar.
+    3. Converts spaces to tabs.
+    4. If a cookie has 6 columns (value is empty), appends an empty string as the 7th column.
+    5. Drops any lines with fewer than 6 columns.
+    6. Preserves valid comments and ensures Netscape header.
     """
     cleaned = content.strip().strip("\"'`")
     lines = []
-    for raw_line in cleaned.splitlines():
-        line = raw_line.strip()
-        if not line:
-            continue
-        if line.startswith("#"):
-            lines.append(line)
-            continue
-        parts = line.split("\t")
-        if len(parts) < 6:
-            sp = re.split(r"\s+", line)
-            if len(sp) >= 6:
-                parts = sp
-        # If line has only 6 columns (empty value), add empty value as 7th column
-        if len(parts) == 6:
-            parts.append("")
-        if len(parts) >= 7:
-            val = "\t".join(parts[6:])
-            fixed = "\t".join(parts[:6] + [val])
-            lines.append(fixed)
-        else:
-            # Skip unparsable line instead of crashing MozillaCookieJar
-            continue
+
+    # Check if user pasted JSON-formatted cookies from a browser extension
+    if cleaned.startswith("[") and cleaned.endswith("]"):
+        try:
+            cookie_list = json.loads(cleaned)
+            if isinstance(cookie_list, list):
+                for item in cookie_list:
+                    if not isinstance(item, dict):
+                        continue
+                    domain = str(item.get("domain", ".youtube.com")).strip()
+                    if not domain:
+                        continue
+                    include_sub = "TRUE" if domain.startswith(".") else "FALSE"
+                    path = str(item.get("path", "/")).strip() or "/"
+                    secure = "TRUE" if item.get("secure", True) else "FALSE"
+                    exp = int(item.get("expirationDate") or item.get("expiry") or 1999999999)
+                    name = str(item.get("name", "")).strip()
+                    val = str(item.get("value", "")).strip()
+                    if name:
+                        lines.append(f"{domain}\t{include_sub}\t{path}\t{secure}\t{exp}\t{name}\t{val}")
+        except Exception:
+            lines = []
+
+    if not lines:
+        for raw_line in cleaned.splitlines():
+            line = raw_line.strip()
+            if not line:
+                continue
+            if line.startswith("#"):
+                # Keep HttpOnly_ lines by stripping the #HttpOnly_ prefix so MozillaCookieJar reads them
+                if line.startswith("#HttpOnly_"):
+                    line = line[len("#HttpOnly_"):]
+                else:
+                    lines.append(line)
+                    continue
+            parts = line.split("\t")
+            if len(parts) < 6:
+                sp = re.split(r"\s+", line)
+                if len(sp) >= 6:
+                    parts = sp
+            # If line has only 6 columns (empty value), add empty value as 7th column
+            if len(parts) == 6:
+                parts.append("")
+            if len(parts) >= 7:
+                val = "\t".join(parts[6:])
+                fixed = "\t".join(parts[:6] + [val])
+                lines.append(fixed)
+            else:
+                continue
 
     has_header = any("# Netscape HTTP Cookie File" in l for l in lines[:5])
     if not has_header:
@@ -99,6 +129,72 @@ def sanitize_cookie_content(content: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _write_working_cookie_copy(sanitized_content: str) -> str:
+    """
+    Write sanitized cookie content to a fresh working file in tempdir.
+    yt-dlp mutates/overwrites its `cookiefile` in-place after every request,
+    which can strip or expire master cookies if given the master file directly.
+    """
+    work_cf = Path(tempfile.gettempdir()) / f"yt_working_cookies_{os.getpid()}.txt"
+    work_cf.write_text(sanitized_content, encoding="utf-8")
+    return str(work_cf.resolve())
+
+
+def get_yt_cookies_file() -> Optional[str]:
+    """
+    Check if YouTube cookies are available from:
+    1. Persistent user_cookies.txt or local cookies.txt
+    2. /tmp/env_cookies.txt
+    3. Streamlit secrets (st.secrets["YOUTUBE_COOKIES"])
+    4. Streamlit session_state (user pasted in sidebar)
+    Returns the resolved string path to an isolated working cookie file or None.
+    """
+    # 1. Check persistent user_cookies.txt or cookies.txt on disk
+    for fname in ["user_cookies.txt", "cookies.txt"]:
+        p = Path(fname)
+        if p.exists() and p.stat().st_size > 0:
+            try:
+                raw = p.read_text(encoding="utf-8")
+                sanitized = sanitize_cookie_content(raw)
+                return _write_working_cookie_copy(sanitized)
+            except Exception:
+                return str(p.resolve())
+
+    # 2. Check /tmp/env_cookies.txt saved from sanitized environment variables
+    env_cf = Path(tempfile.gettempdir()) / "env_cookies.txt"
+    if env_cf.exists() and env_cf.stat().st_size > 0:
+        try:
+            raw = env_cf.read_text(encoding="utf-8")
+            sanitized = sanitize_cookie_content(raw)
+            return _write_working_cookie_copy(sanitized)
+        except Exception:
+            pass
+
+    # 3. Check Streamlit secrets (permanent cloud storage)
+    try:
+        import streamlit as st
+        for key in ["YOUTUBE_COOKIES", "youtube_cookies", "cookies"]:
+            if hasattr(st, "secrets") and key in st.secrets:
+                val = st.secrets[key]
+                if val and str(val).strip():
+                    sanitized = sanitize_cookie_content(str(val))
+                    return _write_working_cookie_copy(sanitized)
+    except Exception:
+        pass
+
+    # 4. Check Streamlit session_state
+    try:
+        import streamlit as st
+        pasted = st.session_state.get("youtube_cookies_text")
+        if pasted and str(pasted).strip():
+            sanitized = sanitize_cookie_content(str(pasted))
+            return _write_working_cookie_copy(sanitized)
+    except Exception:
+        pass
+
+    return None
+
+
 def get_cookie_stats() -> Dict[str, Any]:
     """Return count and validity of active YouTube cookies for UI diagnostics."""
     cfile = get_yt_cookies_file()
@@ -110,7 +206,10 @@ def get_cookie_stats() -> Dict[str, Any]:
         cj.load(ignore_discard=True, ignore_expires=True)
         names = [c.name for c in cj]
         yt_cookies = [c for c in cj if "youtube" in getattr(c, "domain", "") or "google" in getattr(c, "domain", "")]
-        auth_keys = ["SID", "HSID", "SSID", "LOGIN_INFO", "__Secure-3PSID", "SAPISID", "APISID"]
+        auth_keys = [
+            "SID", "HSID", "SSID", "LOGIN_INFO",
+            "__Secure-3PSID", "__Secure-1PSID", "SAPISID", "APISID", "__Secure-3PAPISID"
+        ]
         has_auth = any(n in names for n in auth_keys)
         return {
             "active": len(cj) > 0,
@@ -122,66 +221,6 @@ def get_cookie_stats() -> Dict[str, Any]:
         }
     except Exception as e:
         return {"active": False, "count": 0, "error": str(e), "file": Path(cfile).name}
-
-
-def get_yt_cookies_file() -> Optional[str]:
-    """
-    Check if YouTube cookies are available from:
-    1. Persistent user_cookies.txt or local cookies.txt
-    2. Streamlit secrets (st.secrets["YOUTUBE_COOKIES"])
-    3. Streamlit session_state (user pasted in sidebar)
-    Returns the resolved string path to the cookie file or None.
-    """
-    # 1. Check persistent user_cookies.txt or cookies.txt on disk
-    for fname in ["user_cookies.txt", "cookies.txt"]:
-        p = Path(fname)
-        if p.exists() and p.stat().st_size > 0:
-            try:
-                raw = p.read_text(encoding="utf-8")
-                sanitized = sanitize_cookie_content(raw)
-                p.write_text(sanitized, encoding="utf-8")
-            except Exception:
-                pass
-            return str(p.resolve())
-
-    # 2. Check /tmp/env_cookies.txt saved from sanitized environment variables
-    env_cf = Path(tempfile.gettempdir()) / "env_cookies.txt"
-    if env_cf.exists() and env_cf.stat().st_size > 0:
-        try:
-            raw = env_cf.read_text(encoding="utf-8")
-            sanitized = sanitize_cookie_content(raw)
-            env_cf.write_text(sanitized, encoding="utf-8")
-            return str(env_cf.resolve())
-        except Exception:
-            pass
-
-    # 3. Check Streamlit secrets (permanent cloud storage)
-    try:
-        import streamlit as st
-        for key in ["YOUTUBE_COOKIES", "youtube_cookies", "cookies"]:
-            if hasattr(st, "secrets") and key in st.secrets:
-                val = st.secrets[key]
-                if val and str(val).strip():
-                    temp_cf = Path(tempfile.gettempdir()) / "st_secrets_cookies.txt"
-                    sanitized = sanitize_cookie_content(str(val))
-                    temp_cf.write_text(sanitized, encoding="utf-8")
-                    return str(temp_cf.resolve())
-    except Exception:
-        pass
-
-    # 3. Check Streamlit session_state
-    try:
-        import streamlit as st
-        pasted = st.session_state.get("youtube_cookies_text")
-        if pasted and str(pasted).strip():
-            temp_cf = Path(tempfile.gettempdir()) / "session_cookies.txt"
-            sanitized = sanitize_cookie_content(str(pasted))
-            temp_cf.write_text(sanitized, encoding="utf-8")
-            return str(temp_cf.resolve())
-    except Exception:
-        pass
-
-    return None
 
 
 def format_bytes(size_bytes: Optional[float]) -> str:
