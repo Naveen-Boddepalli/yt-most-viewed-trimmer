@@ -264,69 +264,92 @@ def download_full_video(
 
     ffmpeg_exe = ensure_ffmpeg()
     outtmpl = str(output_dir / "source_%(id)s.%(ext)s")
-
     cookies_file = get_yt_cookies_file()
 
-    ydl_opts: Dict[str, Any] = {
-        "outtmpl": outtmpl,
-        "quiet": True,
-        "no_warnings": True,
-        "no_color": True,
-        "overwrites": False,         # Resume existing download if available
-        "continuedl": True,          # Resume partial download
-        "retries": 25,               # Auto-retry on connection drops
-        "fragment_retries": 25,      # Auto-retry DASH fragments
-        "file_access_retries": 5,
-        "socket_timeout": 30,        # Don't hang on dropped sockets
-        "http_chunk_size": 10485760, # 10 MB chunks to prevent YouTube CDN stream aborts
-        "progress_hooks": [_hook],
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["visionos"],
-            }
-        },
-    }
-
-    if cookies_file and Path(cookies_file).exists():
-        ydl_opts["cookiefile"] = str(cookies_file)
-
-    if ffmpeg_exe and is_ffmpeg_executable(ffmpeg_exe):
-        format_selector = (
-            f"bestvideo[height<={max_height}]+bestaudio/"
-            f"bestvideo*+bestaudio/"
-            f"best[height<={max_height}]/"
-            f"best"
-        )
-        ydl_opts["format"] = format_selector
-        ydl_opts["ffmpeg_location"] = str(ffmpeg_exe)
-        ydl_opts["merge_output_format"] = "mp4"
-    else:
-        # Fallback to single progressive stream to avoid requiring stream merging
-        format_selector = (
-            f"best[height<={max_height}][ext=mp4]/best[height<={max_height}]/best[ext=mp4]/best"
-        )
-        ydl_opts["format"] = format_selector
-
     import yt_dlp
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-    except Exception as exc:
-        if "403" in str(exc) and "cookiefile" in ydl_opts:
-            # Datacenter IP rejected residential cookies; retry without cookies
-            del ydl_opts["cookiefile"]
+
+    configs = []
+    if cookies_file and Path(cookies_file).exists():
+        configs.append({
+            "name": "cookies + web/mobile",
+            "cookiefile": str(cookies_file),
+            "clients": ["web", "mweb", "android", "ios"],
+        })
+    configs.append({
+        "name": "mobile/web direct",
+        "cookiefile": None,
+        "clients": ["mweb", "android", "ios", "web"],
+    })
+    configs.append({
+        "name": "embedded fallback",
+        "cookiefile": None,
+        "clients": ["tv_embedded", "web_embedded", "android"],
+    })
+
+    last_exc = None
+    for cfg in configs:
+        ydl_opts: Dict[str, Any] = {
+            "outtmpl": outtmpl,
+            "quiet": True,
+            "no_warnings": True,
+            "no_color": True,
+            "overwrites": False,
+            "continuedl": True,
+            "retries": 15,
+            "fragment_retries": 15,
+            "file_access_retries": 5,
+            "socket_timeout": 30,
+            "http_chunk_size": 10485760,
+            "progress_hooks": [_hook],
+            "downloader_args": {
+                "ffmpeg_i": ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
+            },
+            "extractor_args": {
+                "youtube": {
+                    "player_client": cfg["clients"],
+                }
+            },
+        }
+
+        if cfg["cookiefile"]:
+            ydl_opts["cookiefile"] = cfg["cookiefile"]
+
+        if ffmpeg_exe and is_ffmpeg_executable(ffmpeg_exe):
+            format_selector = (
+                f"bestvideo[height<={max_height}]+bestaudio/"
+                f"bestvideo*+bestaudio/"
+                f"best[height<={max_height}]/"
+                f"best"
+            )
+            ydl_opts["format"] = format_selector
+            ydl_opts["ffmpeg_location"] = str(ffmpeg_exe)
+            ydl_opts["merge_output_format"] = "mp4"
+        else:
+            format_selector = (
+                f"best[height<={max_height}][ext=mp4]/best[height<={max_height}]/best[ext=mp4]/best"
+            )
+            ydl_opts["format"] = format_selector
+
+        try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=True)
-        else:
-            raise
-        video_id = info.get("id", "video")
-        # Locate downloaded file
-        expected_mp4 = output_dir / f"source_{video_id}.mp4"
-        if expected_mp4.exists():
-            return expected_mp4
-        for candidate in output_dir.glob(f"source_{video_id}.*"):
-            return candidate
-        raise FileNotFoundError("Downloaded video file could not be found in output directory.")
+            video_id = info.get("id", "video") if info else "video"
+            expected_mp4 = output_dir / f"source_{video_id}.mp4"
+            if expected_mp4.exists() and expected_mp4.stat().st_size > 0:
+                return expected_mp4
+            for candidate in output_dir.glob(f"source_{video_id}.*"):
+                if candidate.is_file() and candidate.stat().st_size > 0 and not candidate.name.endswith(".part"):
+                    return candidate
+            for f in output_dir.glob("source_*.*"):
+                if f.is_file() and f.stat().st_size > 0 and not f.name.endswith(".part"):
+                    return f
+        except Exception as exc:
+            last_exc = exc
+            continue
+
+    if last_exc:
+        raise last_exc
+    raise FileNotFoundError("Downloaded video file could not be found in output directory.")
 
 
 def download_single_clip_section(
@@ -365,90 +388,105 @@ def download_single_clip_section(
 
     stem = output_path.stem
     outtmpl = str(output_path.parent / f"{stem}.%(ext)s")
-
     cookies_file = get_yt_cookies_file()
 
-    ydl_opts: Dict[str, Any] = {
-        "outtmpl": outtmpl,
-        "quiet": True,
-        "no_warnings": True,
-        "no_color": True,
-        "overwrites": True,
-        "download_ranges": yt_dlp.utils.download_range_func(None, [(start_time, end_time)]),
-        "force_keyframes_at_cuts": True,
-        "retries": 15,
-        "fragment_retries": 15,
-        "socket_timeout": 30,
-        "progress_hooks": [_hook],
-        "extractor_args": {
-            "youtube": {
-                "player_client": ["visionos"],
-            }
-        },
-    }
-
+    configs = []
     if cookies_file and Path(cookies_file).exists():
-        ydl_opts["cookiefile"] = str(cookies_file)
+        configs.append({
+            "name": "cookies + web/mobile",
+            "cookiefile": str(cookies_file),
+            "clients": ["web", "mweb", "android", "ios"],
+        })
+    configs.append({
+        "name": "mobile/web direct",
+        "cookiefile": None,
+        "clients": ["mweb", "android", "ios", "web"],
+    })
+    configs.append({
+        "name": "embedded fallback",
+        "cookiefile": None,
+        "clients": ["tv_embedded", "web_embedded", "android"],
+    })
 
-    if ffmpeg_exe and is_ffmpeg_executable(ffmpeg_exe):
-        ydl_opts["ffmpeg_location"] = str(ffmpeg_exe)
-        ydl_opts["merge_output_format"] = "mp4"
-        ydl_opts["format"] = (
-            f"bestvideo[height<={max_height}]+bestaudio/"
-            f"bestvideo*+bestaudio/"
-            f"best[height<={max_height}]/"
-            f"best"
-        )
-    else:
-        ydl_opts["format"] = (
-            f"best[height<={max_height}][ext=mp4]/best[height<={max_height}]/best[ext=mp4]/best"
-        )
+    last_exc = None
+    for cfg in configs:
+        ydl_opts: Dict[str, Any] = {
+            "outtmpl": outtmpl,
+            "quiet": True,
+            "no_warnings": True,
+            "no_color": True,
+            "overwrites": True,
+            "download_ranges": yt_dlp.utils.download_range_func(None, [(start_time, end_time)]),
+            "force_keyframes_at_cuts": True,
+            "retries": 10,
+            "fragment_retries": 10,
+            "socket_timeout": 30,
+            "progress_hooks": [_hook],
+            "downloader_args": {
+                "ffmpeg_i": ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
+            },
+            "extractor_args": {
+                "youtube": {
+                    "player_client": cfg["clients"],
+                }
+            },
+        }
 
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-    except Exception as exc:
-        if "403" in str(exc) and "cookiefile" in ydl_opts:
-            # Datacenter IP rejected residential cookies; retry without cookies
-            del ydl_opts["cookiefile"]
+        if cfg["cookiefile"]:
+            ydl_opts["cookiefile"] = cfg["cookiefile"]
+
+        if ffmpeg_exe and is_ffmpeg_executable(ffmpeg_exe):
+            ydl_opts["ffmpeg_location"] = str(ffmpeg_exe)
+            ydl_opts["merge_output_format"] = "mp4"
+            ydl_opts["format"] = (
+                f"bestvideo[height<={max_height}]+bestaudio/"
+                f"bestvideo*+bestaudio/"
+                f"best[height<={max_height}]/"
+                f"best"
+            )
+        else:
+            ydl_opts["format"] = (
+                f"best[height<={max_height}][ext=mp4]/best[height<={max_height}]/best[ext=mp4]/best"
+            )
+
+        try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
-        else:
-            raise
-
-    # Check if exact output_path exists
-    if output_path.exists() and output_path.stat().st_size > 0:
-        return output_path
-
-    # Check for any produced file with this stem (e.g. .mkv, .webm, or stem with tags)
-    candidates = [
-        f for f in output_path.parent.glob(f"{stem}*")
-        if not f.name.endswith(".part") and f.is_file() and f.stat().st_size > 0
-    ]
-    if candidates:
-        chosen = candidates[0]
-        if chosen == output_path:
-            return output_path
-        if chosen.suffix.lower() == ".mp4":
-            shutil.move(str(chosen), str(output_path))
-            return output_path
-        # If it has a different container like webm/mkv, remux to mp4
-        if ffmpeg_exe:
-            subprocess.run(
-                [ffmpeg_exe, "-y", "-i", str(chosen), "-c", "copy", "-movflags", "+faststart", str(output_path)],
-                env=get_clean_env(),
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-            if output_path.exists():
-                try:
-                    chosen.unlink()
-                except Exception:
-                    pass
+            # If download finished, check if file was produced
+            if output_path.exists() and output_path.stat().st_size > 0:
                 return output_path
-        return chosen
+            candidates = [
+                f for f in output_path.parent.glob(f"{stem}*")
+                if not f.name.endswith(".part") and f.is_file() and f.stat().st_size > 0
+            ]
+            if candidates:
+                chosen = candidates[0]
+                if chosen == output_path:
+                    return output_path
+                if chosen.suffix.lower() == ".mp4":
+                    shutil.move(str(chosen), str(output_path))
+                    return output_path
+                if ffmpeg_exe:
+                    subprocess.run(
+                        [ffmpeg_exe, "-y", "-i", str(chosen), "-c", "copy", "-movflags", "+faststart", str(output_path)],
+                        env=get_clean_env(),
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        check=False,
+                    )
+                    if output_path.exists():
+                        try:
+                            chosen.unlink()
+                        except Exception:
+                            pass
+                        return output_path
+                return chosen
+        except Exception as exc:
+            last_exc = exc
+            continue
 
+    if last_exc:
+        raise last_exc
     raise FileNotFoundError(f"Failed to produce stream-trimmed clip: {output_path.name}")
 
 
