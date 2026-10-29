@@ -17,6 +17,8 @@ from utils import (
     strip_ansi,
     get_yt_cookies_file,
     sanitize_cookie_content,
+    sanitize_environment,
+    get_clean_env,
 )
 from yt_processor import (
     extract_most_viewed_segments,
@@ -28,6 +30,7 @@ from video_trimmer import (
     has_ffmpeg,
     ensure_ffmpeg,
     get_ffmpeg_path,
+    is_ffmpeg_executable,
     download_single_clip_section,
     download_and_trim_segments_direct,
     trim_clip_ffmpeg,
@@ -227,6 +230,37 @@ class TestYouTubeMostViewedTrimmer(unittest.TestCase):
             self.assertIsNone(res)
         else:
             self.assertTrue(res is not None and Path(res).exists())
+
+    def test_sanitize_environment_and_clean_env(self):
+        import os
+        os.environ["TEST_HUGE_VAR"] = "X" * 10000
+        os.environ["TEST_YOUTUBE_COOKIES"] = "# Netscape HTTP Cookie File\nexample.com\tTRUE\t/\tTRUE\t0\tk\tv"
+        self.assertIn("TEST_HUGE_VAR", os.environ)
+        
+        sanitize_environment()
+        
+        self.assertNotIn("TEST_HUGE_VAR", os.environ)
+        self.assertNotIn("TEST_YOUTUBE_COOKIES", os.environ)
+        
+        clean = get_clean_env()
+        self.assertIn("PATH", clean)
+        self.assertNotIn("TEST_HUGE_VAR", clean)
+
+    def test_is_ffmpeg_executable_e2big_handling(self):
+        from unittest.mock import patch
+        import shutil
+        import errno
+
+        ffmpeg = shutil.which("ffmpeg")
+        if not ffmpeg:
+            self.skipTest("ffmpeg not on PATH")
+
+        # When subprocess.run raises OSError with errno 7 (E2BIG), it should return True because the file exists and is executable
+        with patch("subprocess.run", side_effect=OSError(errno.E2BIG, "Argument list too long")):
+            self.assertTrue(is_ffmpeg_executable(ffmpeg))
+
+        # But for a non-existent or non-executable path, it returns False
+        self.assertFalse(is_ffmpeg_executable("/nonexistent/binary/path"))
 
 
 if __name__ == "__main__":

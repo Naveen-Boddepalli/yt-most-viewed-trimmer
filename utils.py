@@ -4,7 +4,53 @@ import os
 import re
 import tempfile
 from pathlib import Path
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict
+
+
+def sanitize_environment() -> None:
+    """
+    Remove oversized environment variables that exceed Linux kernel's
+    MAX_ARG_STRLEN (128 KB) or ARG_MAX limit, which causes [Errno 7] Argument list too long.
+    Safely dumps any cookie strings to a temporary file before pruning from os.environ.
+    """
+    for key in list(os.environ.keys()):
+        val = os.environ.get(key, "")
+        val_len = len(val)
+        # If any cookie variable is present, save it to disk and remove from env
+        if "cookie" in key.lower() or key.upper() in ("YOUTUBE_COOKIES", "COOKIES"):
+            if val_len > 0:
+                try:
+                    cfile = Path(tempfile.gettempdir()) / "env_cookies.txt"
+                    if not cfile.exists() or cfile.stat().st_size == 0:
+                        cfile.write_text(val, encoding="utf-8")
+                except Exception:
+                    pass
+            os.environ.pop(key, None)
+            continue
+
+        # Pop any other environment variable exceeding 8 KB (Linux MAX_ARG_STRLEN is 128 KB)
+        if val_len > 8192:
+            os.environ.pop(key, None)
+
+
+def get_clean_env() -> Dict[str, str]:
+    """Return a sanitized environment dictionary safe for Linux execve and child processes."""
+    safe_keys = {
+        "PATH", "LD_LIBRARY_PATH", "HOME", "USER", "LOGNAME", "SHELL",
+        "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TEMP", "TMP",
+        "SYSTEMROOT", "COMSPEC", "PATHEXT", "WINDIR", "PYTHONPATH"
+    }
+    clean = {
+        k: v for k, v in os.environ.items()
+        if (k in safe_keys or len(v) < 4096) and len(v) < 8192
+    }
+    if "PATH" not in clean:
+        clean["PATH"] = os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
+    return clean
+
+
+# Run immediately on module import
+sanitize_environment()
 
 
 def sanitize_cookie_content(content: str) -> str:
@@ -45,7 +91,18 @@ def get_yt_cookies_file() -> Optional[str]:
                 pass
             return str(p.resolve())
 
-    # 2. Check Streamlit secrets (permanent cloud storage)
+    # 2. Check /tmp/env_cookies.txt saved from sanitized environment variables
+    env_cf = Path(tempfile.gettempdir()) / "env_cookies.txt"
+    if env_cf.exists() and env_cf.stat().st_size > 0:
+        try:
+            raw = env_cf.read_text(encoding="utf-8")
+            sanitized = sanitize_cookie_content(raw)
+            env_cf.write_text(sanitized, encoding="utf-8")
+            return str(env_cf.resolve())
+        except Exception:
+            pass
+
+    # 3. Check Streamlit secrets (permanent cloud storage)
     try:
         import streamlit as st
         for key in ["YOUTUBE_COOKIES", "youtube_cookies", "cookies"]:

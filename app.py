@@ -34,7 +34,12 @@ from utils import (
     strip_ansi,
     get_yt_cookies_file,
     sanitize_cookie_content,
+    sanitize_environment,
+    get_clean_env,
 )
+
+# Strip oversized environment variables immediately on app start
+sanitize_environment()
 from yt_processor import (
     HighlightSegment,
     fetch_video_metadata,

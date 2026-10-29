@@ -13,22 +13,49 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from yt_processor import HighlightSegment
-from utils import sanitize_filename, format_timestamp, format_bytes, strip_ansi, get_yt_cookies_file
+from utils import (
+    sanitize_filename,
+    format_timestamp,
+    format_bytes,
+    strip_ansi,
+    get_yt_cookies_file,
+    sanitize_environment,
+    get_clean_env,
+)
+
+# Strip oversized environment variables that cause Linux execve E2BIG [Errno 7]
+sanitize_environment()
 
 
 def is_ffmpeg_executable(path: Optional[str]) -> bool:
     """Verify that a path points to an executable and runnable ffmpeg binary."""
     if not path:
         return False
+    # Resolve command name if no directory separator is present
+    resolved = shutil.which(path) if (os.sep not in path and (os.altsep is None or os.altsep not in path)) else path
+    target = Path(resolved or path)
+    try:
+        if not (target.is_file() and os.access(str(target), os.X_OK)):
+            return False
+    except Exception:
+        return False
+
     try:
         proc = subprocess.run(
-            [path, "-version"],
+            [str(target), "-version"],
+            env=get_clean_env(),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             timeout=5,
         )
         return proc.returncode == 0
+    except OSError as e:
+        # If Linux returns E2BIG (Errno 7: Argument list too long),
+        # but the binary is an executable file, accept it as valid.
+        if getattr(e, "errno", None) == 7:
+            return True
+        return False
     except Exception:
         return False
 
@@ -159,13 +186,18 @@ def get_ffmpeg_diagnostics() -> Dict[str, Any]:
     diag["python"] = sys.version.split()[0]
     diag["shutil_which"] = shutil.which("ffmpeg")
     diag["PATH"] = os.environ.get("PATH", "")
+    diag["env_keys_count"] = len(os.environ)
+    diag["env_total_bytes"] = sum(len(k) + len(v) for k, v in os.environ.items())
+    large_vars = {k: len(v) for k, v in os.environ.items() if len(v) > 500}
+    if large_vars:
+        diag["large_env_vars"] = large_vars
 
     for p in ["/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]:
         exists = os.path.exists(p)
         diag[f"exists_{p}"] = exists
         if exists:
             try:
-                proc = subprocess.run([p, "-version"], capture_output=True, text=True, timeout=3)
+                proc = subprocess.run([p, "-version"], env=get_clean_env(), capture_output=True, text=True, timeout=3)
                 diag[f"run_{p}"] = f"code={proc.returncode}, out={proc.stdout[:40]}"
             except Exception as e:
                 diag[f"run_{p}_err"] = str(e)
@@ -184,7 +216,7 @@ def get_ffmpeg_diagnostics() -> Dict[str, Any]:
     diag["tmp_target_exists"] = tmp_target.exists()
     if tmp_target.exists():
         try:
-            proc = subprocess.run([str(tmp_target), "-version"], capture_output=True, text=True, timeout=3)
+            proc = subprocess.run([str(tmp_target), "-version"], env=get_clean_env(), capture_output=True, text=True, timeout=3)
             diag["tmp_target_run"] = f"code={proc.returncode}, out={proc.stdout[:40]}"
         except Exception as e:
             diag["tmp_target_err"] = str(e)
@@ -404,6 +436,7 @@ def download_single_clip_section(
         if ffmpeg_exe:
             subprocess.run(
                 [ffmpeg_exe, "-y", "-i", str(chosen), "-c", "copy", "-movflags", "+faststart", str(output_path)],
+                env=get_clean_env(),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 check=False,
@@ -503,7 +536,7 @@ def trim_clip_ffmpeg(
                 "-movflags", "+faststart",
                 str(output_path),
             ]
-        proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        proc = subprocess.run(cmd, env=get_clean_env(), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         if proc.returncode == 0 and output_path.exists():
             return output_path
 

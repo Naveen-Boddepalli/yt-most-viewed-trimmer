@@ -11,6 +11,12 @@ try:
 except Exception:
     pass
 
+try:
+    from utils import sanitize_environment
+    sanitize_environment()
+except Exception:
+    pass
+
 import runpy
 
 app_path = ROOT_DIR / "app.py"
