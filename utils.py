@@ -56,7 +56,11 @@ sanitize_environment()
 def sanitize_cookie_content(content: str) -> str:
     """
     Ensure the cookie content has the proper Netscape HTTP Cookie File format for yt-dlp.
-    Converts spaces to tabs, preserves comments, and ensures valid Netscape header.
+    1. Removes malformed lines that crash MozillaCookieJar.
+    2. Converts spaces to tabs.
+    3. If a cookie has 6 columns (value is empty), appends an empty string as the 7th column.
+    4. Drops any lines with fewer than 6 columns.
+    5. Preserves valid comments and ensures Netscape header.
     """
     cleaned = content.strip().strip("\"'`")
     lines = []
@@ -68,16 +72,20 @@ def sanitize_cookie_content(content: str) -> str:
             lines.append(line)
             continue
         parts = line.split("\t")
+        if len(parts) < 6:
+            sp = re.split(r"\s+", line)
+            if len(sp) >= 6:
+                parts = sp
+        # If line has only 6 columns (empty value), add empty value as 7th column
+        if len(parts) == 6:
+            parts.append("")
         if len(parts) >= 7:
-            lines.append(line)
-            continue
-        # If space-separated, convert to tab-separated Netscape format
-        sp = re.split(r"\s+", line)
-        if len(sp) >= 7:
-            fixed = "\t".join(sp[:6] + [" ".join(sp[6:])])
+            val = "\t".join(parts[6:])
+            fixed = "\t".join(parts[:6] + [val])
             lines.append(fixed)
         else:
-            lines.append(line)
+            # Skip unparsable line instead of crashing MozillaCookieJar
+            continue
 
     has_header = any("# Netscape HTTP Cookie File" in l for l in lines[:5])
     if not has_header:
