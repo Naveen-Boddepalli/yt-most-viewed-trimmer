@@ -460,21 +460,18 @@ with st.sidebar:
             key="cookie_textarea_box",
             help="Export cookies from your browser using 'Get cookies.txt LOCALLY' or 'Cookie-Editor'.",
         )
-        if cookie_text.strip() and cookie_text.strip() != st.session_state.get("youtube_cookies_text", ""):
-            sanitized = sanitize_cookie_content(cookie_text.strip())
-            Path("user_cookies.txt").write_text(sanitized, encoding="utf-8")
-            st.session_state["youtube_cookies_text"] = sanitized
-            st.rerun()
 
         col_c1, col_c2 = st.columns([1, 1])
         with col_c1:
-            if has_active_cookies:
-                auth_badge = "🔐 Logged-In" if cookie_stats.get("has_auth") else "⚠️ No SID/LOGIN_INFO"
-                st.success(f"✅ {cookie_stats['count']} cookies ({auth_badge})")
-            elif cookie_stats.get("error"):
-                st.error(f"⚠️ Syntax: {cookie_stats['error']}")
+            if st.button("💾 Save Cookies", key="save_sidebar_cookie_btn", **STRETCH_WIDTH):
+                if cookie_text.strip():
+                    sanitized = sanitize_cookie_content(cookie_text.strip())
+                    Path("user_cookies.txt").write_text(sanitized, encoding="utf-8")
+                    st.session_state["youtube_cookies_text"] = sanitized
+                    st.success("✅ Cookies saved!")
+                    st.rerun()
         with col_c2:
-            if has_active_cookies and st.button("🗑️ Clear Cookies", **STRETCH_WIDTH):
+            if has_active_cookies and st.button("🗑️ Clear Cookies", key="clear_sidebar_cookie_btn", **STRETCH_WIDTH):
                 for f in ["user_cookies.txt", "cookies.txt"]:
                     if Path(f).exists():
                         Path(f).unlink()
@@ -485,6 +482,12 @@ with st.sidebar:
                         pass
                 st.session_state["youtube_cookies_text"] = ""
                 st.rerun()
+
+        if has_active_cookies:
+            auth_badge = "🔐 Logged-In" if cookie_stats.get("has_auth") else "⚠️ No SID/LOGIN_INFO"
+            st.success(f"✅ {cookie_stats['count']} cookies ({auth_badge})")
+        elif cookie_stats.get("error"):
+            st.error(f"⚠️ Syntax: {cookie_stats['error']}")
 
     st.divider()
     active_ffmpeg = ensure_ffmpeg()
