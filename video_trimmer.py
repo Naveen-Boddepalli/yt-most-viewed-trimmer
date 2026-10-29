@@ -295,14 +295,25 @@ def download_full_video(
             "no_color": True,
             "overwrites": False,
             "continuedl": True,
+            "source_address": "0.0.0.0",
+            "cachedir": False,
             "retries": 15,
             "fragment_retries": 15,
             "file_access_retries": 5,
             "socket_timeout": 30,
             "http_chunk_size": 10485760,
             "progress_hooks": [_hook],
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
             "downloader_args": {
-                "ffmpeg_i": ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
+                "ffmpeg_i": [
+                    "-reconnect", "1",
+                    "-reconnect_streamed", "1",
+                    "-reconnect_delay_max", "5",
+                    "-headers", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36\r\n",
+                ]
             },
             "extractor_args": {
                 "youtube": {
@@ -316,9 +327,9 @@ def download_full_video(
 
         if ffmpeg_exe and is_ffmpeg_executable(ffmpeg_exe):
             format_selector = (
-                f"bestvideo[height<={max_height}]+bestaudio/"
-                f"bestvideo*+bestaudio/"
+                f"best[height<={max_height}][ext=mp4]/"
                 f"best[height<={max_height}]/"
+                f"bestvideo[height<={max_height}]+bestaudio/"
                 f"best"
             )
             ydl_opts["format"] = format_selector
@@ -416,14 +427,25 @@ def download_single_clip_section(
             "no_warnings": True,
             "no_color": True,
             "overwrites": True,
+            "source_address": "0.0.0.0",
+            "cachedir": False,
             "download_ranges": yt_dlp.utils.download_range_func(None, [(start_time, end_time)]),
             "force_keyframes_at_cuts": True,
             "retries": 10,
             "fragment_retries": 10,
             "socket_timeout": 30,
             "progress_hooks": [_hook],
+            "http_headers": {
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+                "Accept-Language": "en-US,en;q=0.9",
+            },
             "downloader_args": {
-                "ffmpeg_i": ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
+                "ffmpeg_i": [
+                    "-reconnect", "1",
+                    "-reconnect_streamed", "1",
+                    "-reconnect_delay_max", "5",
+                    "-headers", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36\r\n",
+                ]
             },
             "extractor_args": {
                 "youtube": {
@@ -439,14 +461,14 @@ def download_single_clip_section(
             ydl_opts["ffmpeg_location"] = str(ffmpeg_exe)
             ydl_opts["merge_output_format"] = "mp4"
             ydl_opts["format"] = (
-                f"bestvideo[height<={max_height}]+bestaudio/"
-                f"bestvideo*+bestaudio/"
+                f"best[height<={max_height}][ext=mp4]/"
                 f"best[height<={max_height}]/"
+                f"bestvideo[height<={max_height}]+bestaudio/"
                 f"best"
             )
         else:
             ydl_opts["format"] = (
-                f"best[height<={max_height}][ext=mp4]/best[height<={max_height}]/best[ext=mp4]/best"
+                f"best[height<={max_height}][ext=mp4]/best[height<={max_height}]/best"
             )
 
         try:

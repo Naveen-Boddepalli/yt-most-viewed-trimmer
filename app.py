@@ -34,6 +34,7 @@ from utils import (
     strip_ansi,
     get_yt_cookies_file,
     sanitize_cookie_content,
+    get_cookie_stats,
     sanitize_environment,
     get_clean_env,
 )
@@ -302,8 +303,10 @@ with st.sidebar:
     )
     is_direct_stream_trim = "Direct Stream-Trim" in trim_strategy
 
-    has_active_cookies = bool(get_yt_cookies_file())
-    with st.expander(f"🍪 YouTube Cookies / Bot Bypass {'(Active ✅)' if has_active_cookies else ''}", expanded=not has_active_cookies):
+    cookie_stats = get_cookie_stats()
+    has_active_cookies = cookie_stats.get("active", False)
+    badge = f"({cookie_stats.get('count', 0)} Active ✅)" if has_active_cookies else ""
+    with st.expander(f"🍪 YouTube Cookies / Bot Bypass {badge}", expanded=not has_active_cookies):
         st.caption(
             "Cloud servers (Streamlit Cloud, AWS) are flagged by YouTube's bot detection. "
             "Pasting your `cookies.txt` here saves it persistently on this server so you never have to paste again."
@@ -317,18 +320,26 @@ with st.sidebar:
             help="Export cookies from your browser using an extension like 'Get cookies.txt LOCALLY'.",
         )
         if cookie_text.strip() and cookie_text.strip() != st.session_state.get("youtube_cookies_text", ""):
-            Path("user_cookies.txt").write_text(cookie_text.strip(), encoding="utf-8")
-            st.session_state["youtube_cookies_text"] = cookie_text.strip()
+            sanitized = sanitize_cookie_content(cookie_text.strip())
+            Path("user_cookies.txt").write_text(sanitized, encoding="utf-8")
+            st.session_state["youtube_cookies_text"] = sanitized
             st.rerun()
 
         col_c1, col_c2 = st.columns([1, 1])
         with col_c1:
             if has_active_cookies:
-                st.success("✅ Cookies active & saved!")
+                auth_badge = "🔐 Logged-In" if cookie_stats.get("has_auth") else "⚠️ No SID/LOGIN_INFO"
+                st.success(f"✅ {cookie_stats['count']} cookies ({auth_badge})")
+            elif cookie_stats.get("error"):
+                st.error(f"⚠️ Syntax: {cookie_stats['error']}")
         with col_c2:
             if has_active_cookies and st.button("🗑️ Clear Cookies", **STRETCH_WIDTH):
-                if Path("user_cookies.txt").exists():
-                    Path("user_cookies.txt").unlink()
+                for f in ["user_cookies.txt", "cookies.txt"]:
+                    if Path(f).exists():
+                        Path(f).unlink()
+                env_f = Path(tempfile.gettempdir()) / "env_cookies.txt"
+                if env_f.exists():
+                    env_f.unlink()
                 st.session_state["youtube_cookies_text"] = ""
                 st.rerun()
 

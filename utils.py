@@ -4,7 +4,7 @@ import os
 import re
 import tempfile
 from pathlib import Path
-from typing import Tuple, Optional, Dict
+from typing import Tuple, Optional, Dict, Any
 
 
 def sanitize_environment() -> None:
@@ -22,7 +22,7 @@ def sanitize_environment() -> None:
                 try:
                     cfile = Path(tempfile.gettempdir()) / "env_cookies.txt"
                     if not cfile.exists() or cfile.stat().st_size == 0:
-                        cfile.write_text(val, encoding="utf-8")
+                        cfile.write_text(sanitize_cookie_content(val), encoding="utf-8")
                 except Exception:
                     pass
             os.environ.pop(key, None)
@@ -54,11 +54,31 @@ sanitize_environment()
 
 
 def sanitize_cookie_content(content: str) -> str:
-    """Ensure the cookie content has the proper Netscape HTTP Cookie File header for yt-dlp."""
+    """
+    Ensure the cookie content has the proper Netscape HTTP Cookie File format for yt-dlp.
+    Converts spaces to tabs, preserves comments, and ensures valid Netscape header.
+    """
     cleaned = content.strip().strip("\"'`")
-    lines = [l.rstrip() for l in cleaned.splitlines()]
-    while lines and not lines[0]:
-        lines.pop(0)
+    lines = []
+    for raw_line in cleaned.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        if line.startswith("#"):
+            lines.append(line)
+            continue
+        parts = line.split("\t")
+        if len(parts) >= 7:
+            lines.append(line)
+            continue
+        # If space-separated, convert to tab-separated Netscape format
+        sp = re.split(r"\s+", line)
+        if len(sp) >= 7:
+            fixed = "\t".join(sp[:6] + [" ".join(sp[6:])])
+            lines.append(fixed)
+        else:
+            lines.append(line)
+
     has_header = any("# Netscape HTTP Cookie File" in l for l in lines[:5])
     if not has_header:
         header = [
@@ -69,6 +89,31 @@ def sanitize_cookie_content(content: str) -> str:
         ]
         lines = header + lines
     return "\n".join(lines) + "\n"
+
+
+def get_cookie_stats() -> Dict[str, Any]:
+    """Return count and validity of active YouTube cookies for UI diagnostics."""
+    cfile = get_yt_cookies_file()
+    if not cfile or not Path(cfile).exists() or Path(cfile).stat().st_size == 0:
+        return {"active": False, "count": 0, "names": [], "has_auth": False}
+    import http.cookiejar
+    cj = http.cookiejar.MozillaCookieJar(cfile)
+    try:
+        cj.load(ignore_discard=True, ignore_expires=True)
+        names = [c.name for c in cj]
+        yt_cookies = [c for c in cj if "youtube" in getattr(c, "domain", "") or "google" in getattr(c, "domain", "")]
+        auth_keys = ["SID", "HSID", "SSID", "LOGIN_INFO", "__Secure-3PSID", "SAPISID", "APISID"]
+        has_auth = any(n in names for n in auth_keys)
+        return {
+            "active": len(cj) > 0,
+            "count": len(cj),
+            "yt_count": len(yt_cookies),
+            "names": names[:12],
+            "has_auth": has_auth,
+            "file": Path(cfile).name,
+        }
+    except Exception as e:
+        return {"active": False, "count": 0, "error": str(e), "file": Path(cfile).name}
 
 
 def get_yt_cookies_file() -> Optional[str]:

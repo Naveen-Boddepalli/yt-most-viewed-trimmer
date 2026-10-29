@@ -220,10 +220,11 @@ class TestYouTubeMostViewedTrimmer(unittest.TestCase):
         self.assertIn("segments", sig2.parameters)
 
     def test_get_yt_cookies_file(self):
-        # Test sanitize_cookie_content header injection
-        raw = "example.com\tTRUE\t/\tTRUE\t0\tfoo\tbar"
-        sanitized = sanitize_cookie_content(raw)
+        # Test sanitize_cookie_content header injection and space-to-tab conversion
+        raw_spaces = ".youtube.com TRUE / TRUE 1999999999 SID test_sid_val"
+        sanitized = sanitize_cookie_content(raw_spaces)
         self.assertTrue(sanitized.startswith("# Netscape HTTP Cookie File"))
+        self.assertIn(".youtube.com\tTRUE\t/\tTRUE\t1999999999\tSID\ttest_sid_val", sanitized)
 
         res = get_yt_cookies_file()
         if not Path("user_cookies.txt").exists() and not Path("cookies.txt").exists():
