@@ -10,7 +10,7 @@ _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from utils import format_timestamp, get_yt_cookies_file
+from utils import format_timestamp, get_yt_cookies_file, get_js_runtimes
 
 
 @dataclass
@@ -49,28 +49,34 @@ def fetch_video_metadata(url: str, cookies_file: Optional[str] = None) -> Dict[s
 
     # Always obtain a fresh working cookie copy if available
     active_cookies = cookies_file or get_yt_cookies_file()
+    has_cookies = bool(active_cookies and Path(active_cookies).exists())
+    js_runtimes = get_js_runtimes()
 
-    # Note: 'web' and 'mweb' return YouTube's 'heatmap' (Most Replayed) array.
-    # Try cookie-authenticated web/mweb first, then cookieless web/visionos/android_vr,
-    # then tv/embedded fallback.
+    # Note: 'web', 'mweb', and 'visionos' return YouTube's 'heatmap' (Most Replayed) array.
+    # Keep cookie-supporting clients separate from cookieless-only clients ('visionos', 'android')
+    # because passing cookiefile causes yt-dlp to skip cookieless-only clients.
     attempts = []
-    if active_cookies and Path(active_cookies).exists():
+    if has_cookies:
         attempts.append({
             "use_cookies": True,
-            "clients": ["web", "mweb", "tv"],
+            "clients": ["web", "mweb"],
         })
     attempts.extend([
         {
             "use_cookies": False,
-            "clients": ["web", "mweb", "visionos"],
+            "clients": ["visionos"],
         },
         {
             "use_cookies": False,
-            "clients": ["android_vr", "ios", "tv_embedded"],
+            "clients": ["web", "mweb"],
         },
         {
-            "use_cookies": True if (active_cookies and Path(active_cookies).exists()) else False,
-            "clients": ["tv_embedded", "web_creator", "mediaconnect"],
+            "use_cookies": False,
+            "clients": ["android_vr", "android", "tv_simply"],
+        },
+        {
+            "use_cookies": has_cookies,
+            "clients": ["tv_samsung", "web_safari"],
         },
     ])
 
@@ -83,7 +89,11 @@ def fetch_video_metadata(url: str, cookies_file: Optional[str] = None) -> Dict[s
             "extract_flat": False,
             "ignore_no_formats_error": True,
             "cachedir": False,
+            "nocheckcertificate": True,
+            "source_address": "0.0.0.0",
             "socket_timeout": 25,
+            "js_runtimes": js_runtimes,
+            "remote_components": ["ejs:github"],
             "extractor_args": {
                 "youtube": {
                     "player_client": attempt["clients"],
@@ -107,28 +117,33 @@ def fetch_video_metadata(url: str, cookies_file: Optional[str] = None) -> Dict[s
     # Final fallback: try pytubefix metadata if yt-dlp is completely blocked
     try:
         from pytubefix import YouTube
-        yt = YouTube(url, client="ANDROID_VR")
-        chapters_list = []
-        if getattr(yt, "chapters", None):
-            for ch in yt.chapters:
-                st_sec = float(getattr(ch, "start_seconds", 0.0))
-                dur_sec = float(getattr(ch, "duration", 20.0))
-                chapters_list.append({
-                    "start_time": st_sec,
-                    "end_time": st_sec + dur_sec,
-                    "title": getattr(ch, "title", "Chapter"),
-                })
-        return {
-            "id": yt.video_id,
-            "title": yt.title or "YouTube Video",
-            "uploader": yt.author or "YouTube Channel",
-            "duration": float(yt.length or 0.0),
-            "view_count": int(yt.views or 0),
-            "thumbnail": yt.thumbnail_url,
-            "description": yt.description or "",
-            "chapters": chapters_list,
-            "heatmap": None,
-        }
+        for pt_client in ("ANDROID_VR", "IOS", "WEB"):
+            try:
+                yt = YouTube(url, client=pt_client)
+                chapters_list = []
+                if getattr(yt, "chapters", None):
+                    for ch in yt.chapters:
+                        st_sec = float(getattr(ch, "start_seconds", 0.0))
+                        dur_sec = float(getattr(ch, "duration", 20.0))
+                        chapters_list.append({
+                            "start_time": st_sec,
+                            "end_time": st_sec + dur_sec,
+                            "title": getattr(ch, "title", "Chapter"),
+                        })
+                if yt.length or yt.title:
+                    return {
+                        "id": yt.video_id,
+                        "title": yt.title or "YouTube Video",
+                        "uploader": yt.author or "YouTube Channel",
+                        "duration": float(yt.length or 0.0),
+                        "view_count": int(yt.views or 0),
+                        "thumbnail": yt.thumbnail_url,
+                        "description": yt.description or "",
+                        "chapters": chapters_list,
+                        "heatmap": None,
+                    }
+            except Exception:
+                continue
     except Exception:
         pass
 

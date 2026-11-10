@@ -34,6 +34,8 @@ from utils import (
     strip_ansi,
     get_yt_cookies_file,
     sanitize_cookie_content,
+    save_yt_cookies,
+    clear_yt_cookies,
     get_cookie_stats,
     sanitize_environment,
     get_clean_env,
@@ -162,11 +164,17 @@ def init_session_state():
             st.session_state[k] = v
 
     if "youtube_cookies_text" not in st.session_state:
-        saved_cf = Path("user_cookies.txt")
-        if saved_cf.exists() and saved_cf.stat().st_size > 0:
-            st.session_state["youtube_cookies_text"] = saved_cf.read_text(encoding="utf-8")
-        else:
-            st.session_state["youtube_cookies_text"] = ""
+        saved_text = ""
+        for saved_cf in (Path("user_cookies.txt"), Path(tempfile.gettempdir()) / "user_cookies.txt"):
+            if saved_cf.exists() and saved_cf.stat().st_size > 0:
+                saved_text = saved_cf.read_text(encoding="utf-8")
+                break
+        st.session_state["youtube_cookies_text"] = saved_text
+
+    if "_pending_cookie_box_val" in st.session_state:
+        st.session_state["cookie_textarea_box"] = st.session_state.pop("_pending_cookie_box_val")
+    elif "cookie_textarea_box" not in st.session_state:
+        st.session_state["cookie_textarea_box"] = st.session_state["youtube_cookies_text"]
 
 
 init_session_state()
@@ -446,46 +454,51 @@ with st.sidebar:
 
     cookie_stats = get_cookie_stats()
     has_active_cookies = cookie_stats.get("active", False)
-    badge = f"({cookie_stats.get('count', 0)} Active ✅)" if has_active_cookies else ""
+    yt_count = cookie_stats.get("yt_count", 0)
+    has_auth = cookie_stats.get("has_auth", False)
+    badge = f"({yt_count} Active ✅)" if has_active_cookies else ""
     with st.expander(f"🍪 YouTube Cookies / Bot Bypass {badge}", expanded=not has_active_cookies):
         st.caption(
-            "Cloud servers (Streamlit Cloud, AWS) are flagged by YouTube's bot detection. "
-            "Paste your `cookies.txt` (Netscape or JSON format) here to save it on this server."
+            "Cloud servers (Streamlit Cloud, AWS) can be flagged by YouTube's bot detection. "
+            "Our Direct Stream-Trim engine uses Apple VisionOS & Android clients which bypass bot detection automatically. "
+            "If a video is age-restricted or private, paste your exported YouTube `cookies.txt` here."
         )
         cookie_text = st.text_area(
-            "Paste cookies.txt content",
-            value=st.session_state.get("youtube_cookies_text", ""),
-            placeholder="# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t...\t...",
+            "Paste cookies (Netscape, JSON, or DevTools)",
+            placeholder="# Netscape HTTP Cookie File\n.youtube.com\tTRUE\t/\tTRUE\t...\nOR JSON [{\"name\":\"LOGIN_INFO\",...}]\nOR DevTools Name / Value pairs",
             height=120,
             key="cookie_textarea_box",
-            help="Export cookies from your browser using 'Get cookies.txt LOCALLY' or 'Cookie-Editor'.",
+            help="Export cookies while logged into YouTube using the free extension 'Get cookies.txt LOCALLY' or 'Cookie-Editor'.",
         )
 
         col_c1, col_c2 = st.columns([1, 1])
         with col_c1:
             if st.button("💾 Save Cookies", key="save_sidebar_cookie_btn", **STRETCH_WIDTH):
                 if cookie_text.strip():
-                    sanitized = sanitize_cookie_content(cookie_text.strip())
-                    Path("user_cookies.txt").write_text(sanitized, encoding="utf-8")
+                    sanitized = save_yt_cookies(cookie_text.strip())
                     st.session_state["youtube_cookies_text"] = sanitized
+                    st.session_state["_pending_cookie_box_val"] = sanitized
                     st.success("✅ Cookies saved!")
                     st.rerun()
         with col_c2:
             if has_active_cookies and st.button("🗑️ Clear Cookies", key="clear_sidebar_cookie_btn", **STRETCH_WIDTH):
-                for f in ["user_cookies.txt", "cookies.txt"]:
-                    if Path(f).exists():
-                        Path(f).unlink()
-                for tmp_f in Path(tempfile.gettempdir()).glob("*cookies*.txt"):
-                    try:
-                        tmp_f.unlink()
-                    except Exception:
-                        pass
+                clear_yt_cookies()
                 st.session_state["youtube_cookies_text"] = ""
+                st.session_state["_pending_cookie_box_val"] = ""
                 st.rerun()
 
         if has_active_cookies:
-            auth_badge = "🔐 Logged-In" if cookie_stats.get("has_auth") else "⚠️ No SID/LOGIN_INFO"
-            st.success(f"✅ {cookie_stats['count']} cookies ({auth_badge})")
+            if has_auth:
+                st.success(f"✅ {yt_count} YouTube cookies (🔐 Logged-In Session)")
+            else:
+                st.warning(
+                    f"⚠️ {yt_count} YouTube cookies saved, but **No YouTube Login Session** detected "
+                    "(missing `LOGIN_INFO` or `__Secure-1PSID` for youtube.com).\n\n"
+                    "👉 **How to export logged-in cookies:**\n"
+                    "1. Install **'Get cookies.txt LOCALLY'** extension in Chrome/Edge.\n"
+                    "2. Open **youtube.com** (ensure your profile picture is visible).\n"
+                    "3. Click the extension -> **Export** -> Paste here."
+                )
         elif cookie_stats.get("error"):
             st.error(f"⚠️ Syntax: {cookie_stats['error']}")
 
@@ -541,7 +554,7 @@ active_cookie_file = get_yt_cookies_file()
 if not active_cookie_file:
     with st.expander("🔑 YouTube Authentication (Optional — Helpful for Age/Bot-Restricted Videos on Cloud)", expanded=False):
         st.info(
-            "💡 **Cloud Bot-Bypass Built-In**: This app automatically rotates across `ANDROID_VR`, `IOS`, `TV`, and `WEB_SAFARI` clients plus a secondary `pytubefix` engine. "
+            "💡 **Cloud Bot-Bypass Built-In**: This app automatically slices HLS streams in Python and rotates across `visionos`, `android`, `web`/`web_safari` (with JS challenge solver), plus `pytubefix`. "
             "If a specific video still requires login on Streamlit Cloud, paste your exported YouTube `cookies.txt` below."
         )
         main_cookie_text = st.text_area(
@@ -552,9 +565,9 @@ if not active_cookie_file:
         )
         if st.button("💾 Save & Authenticate Cookies", type="primary", key="save_main_cookie_btn"):
             if main_cookie_text.strip():
-                sanitized = sanitize_cookie_content(main_cookie_text)
-                Path("user_cookies.txt").write_text(sanitized, encoding="utf-8")
+                sanitized = save_yt_cookies(main_cookie_text)
                 st.session_state["youtube_cookies_text"] = sanitized
+                st.session_state["_pending_cookie_box_val"] = sanitized
                 st.success("✅ Cookies saved and activated! You can now trim videos.")
                 st.rerun()
 else:
@@ -879,8 +892,9 @@ if info:
             st.error(f"{prefix}: {clean_msg}")
             if "403" in clean_msg or "bot" in clean_msg.lower() or "sign in" in clean_msg.lower():
                 st.warning(
-                    "🔒 **YouTube Cloud Datacenter Restriction (HTTP 403)**: "
-                    "Try exporting a fresh `cookies.txt` from an incognito/new browser tab while logged into YouTube and pasting it into **🍪 YouTube Cookies / Bot Bypass** in the sidebar, or switch resolution to **480p / 360p**."
+                    "🔒 **YouTube Bot / Cloud Restriction**: "
+                    "YouTube challenged this request. Direct Stream-Trim automatically tries Apple VisionOS and Android clients to bypass bot checks. "
+                    "If the video is age-restricted or private, export a fresh `cookies.txt` using the free 'Get cookies.txt LOCALLY' extension while logged into YouTube and paste it into **🍪 YouTube Cookies / Bot Bypass** in the sidebar."
                 )
 
         def trim_single_segment_smart(target_seg: HighlightSegment):
@@ -1082,24 +1096,22 @@ if info:
                     else ""
                 )
 
-                st.markdown(
-                    f"""
-                    <div class="clip-card">
-                        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">
-                            <span style="font-size:1.08rem; font-weight:700;">#{seg.rank} — {seg.time_range_str}</span>
-                            <span class="score-badge">🔥 {int(round(seg.score * 100))}% Replay Score</span>
-                        </div>
-                        <div style="font-size:0.88rem; color:#B0BAC9; margin-bottom:6px;">
-                            <b>Peak Moment:</b> {format_timestamp(seg.peak_time)} &nbsp;|&nbsp;
-                            <b>Duration:</b> {seg.duration:.1f}s &nbsp;|&nbsp;
-                            {size_badge_html} &nbsp;|&nbsp;
-                            <span class="source-badge">{seg.source}</span>
-                            {crop_pill}
-                        </div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
+                card_html = (
+                    f'<div class="clip-card">\n'
+                    f'  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">\n'
+                    f'    <span style="font-size:1.08rem; font-weight:700;">#{seg.rank} — {seg.time_range_str}</span>\n'
+                    f'    <span class="score-badge">🔥 {int(round(seg.score * 100))}% Replay Score</span>\n'
+                    f'  </div>\n'
+                    f'  <div style="font-size:0.88rem; color:#B0BAC9; margin-bottom:6px;">\n'
+                    f'    <b>Peak Moment:</b> {format_timestamp(seg.peak_time)} &nbsp;|&nbsp;\n'
+                    f'    <b>Duration:</b> {seg.duration:.1f}s &nbsp;|&nbsp;\n'
+                    f'    {size_badge_html} &nbsp;|&nbsp;\n'
+                    f'    <span class="source-badge">{seg.source}</span>\n'
+                    f'    {crop_pill}\n'
+                    f'  </div>\n'
+                    f'</div>'
                 )
+                st.markdown(card_html, unsafe_allow_html=True)
 
                 if is_trimmed:
                     st.video(str(clip_file))

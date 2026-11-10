@@ -26,6 +26,7 @@ from utils import (
     get_yt_cookies_file,
     sanitize_environment,
     get_clean_env,
+    get_js_runtimes,
 )
 
 # Strip oversized environment variables that cause Linux execve E2BIG [Errno 7]
@@ -368,6 +369,12 @@ def get_ffmpeg_diagnostics() -> Dict[str, Any]:
             except Exception as e:
                 diag[f"run_{p}_err"] = str(e)
 
+    diag["js_runtimes"] = get_js_runtimes()
+    try:
+        import yt_dlp
+        diag["yt_dlp_version"] = yt_dlp.version.__version__
+    except Exception:
+        pass
     diag["ensure_ffmpeg_result"] = ensure_ffmpeg()
     return diag
 
@@ -387,19 +394,64 @@ def has_ffmpeg() -> bool:
 # ------------------------------------------------------------------------------
 def _build_client_profiles() -> List[Dict[str, Any]]:
     """
-    Build isolated single-client profiles for yt-dlp.
-    Why this ordering and isolation fixes Streamlit Cloud 403 / FFmpeg code 8:
-    1. Cookieless `android_vr` and `ios` run FIRST because:
-       - In yt-dlp, passing `cookiefile` causes yt-dlp to skip `android_vr` and `ios` completely.
-       - Cookies exported from a user's home ISP often trigger IP-mismatch 403s when replayed
-         from a Streamlit Cloud (GCP us-central1) datacenter IP on `web`/`mweb`.
-       - `android_vr` and `ios` do NOT require browser PO tokens and provide direct MP4 / HLS streams.
-    2. If the video is age-restricted or login-gated, cookie-authenticated `tv`, `web_safari`,
-       `web_creator`, and `mweb` profiles run next using an isolated working copy of the cookies.
-    3. Never overrides `User-Agent` in `http_headers` so each client uses its exact matching UA.
+    Build prioritized, cloud-resilient player client profiles for yt-dlp.
+
+    Why this ordering fixes Streamlit Cloud bot detection & HTTP 403:
+    1. `visionos` (Apple Vision Pro client) runs FIRST (cookieless):
+       - Bypasses YouTube browser bot detection on datacenter IPs without a PO Token or JS challenge.
+       - Provides direct HLS & DASH streams up to 1080p.
+    2. `android` (Android mobile client) runs next (cookieless):
+       - Direct progressive MP4 streams (360p).
+    3. Authenticated cookie-supporting profiles (`default`, `tv_samsung`, `web_safari`)
+       run next if valid cookies exist (note: `visionos`, `android`, `android_vr`, and `ios`
+       do not support cookies in yt-dlp, so cookies are never passed to them).
+    4. Cookieless fallbacks (`default`, `android_vr`, `ios`, `tv_samsung`, `web_safari`).
     """
     has_cookies = bool(get_yt_cookies_file())
     profiles: List[Dict[str, Any]] = [
+        {
+            "name": "visionos_direct",
+            "use_cookies": False,
+            "clients": ["visionos"],
+            "prefer_hls_or_prog": False,
+        },
+        {
+            "name": "android_direct",
+            "use_cookies": False,
+            "clients": ["android"],
+            "prefer_hls_or_prog": True,
+        },
+    ]
+
+    if has_cookies:
+        profiles.extend([
+            {
+                "name": "default_authenticated",
+                "use_cookies": True,
+                "clients": None,
+                "prefer_hls_or_prog": False,
+            },
+            {
+                "name": "tv_samsung_authenticated",
+                "use_cookies": True,
+                "clients": ["tv_samsung"],
+                "prefer_hls_or_prog": False,
+            },
+            {
+                "name": "web_safari_authenticated",
+                "use_cookies": True,
+                "clients": ["web_safari"],
+                "prefer_hls_or_prog": True,
+            },
+        ])
+
+    profiles.extend([
+        {
+            "name": "default_direct",
+            "use_cookies": False,
+            "clients": None,
+            "prefer_hls_or_prog": False,
+        },
         {
             "name": "android_vr_direct",
             "use_cookies": False,
@@ -412,48 +464,17 @@ def _build_client_profiles() -> List[Dict[str, Any]]:
             "clients": ["ios"],
             "prefer_hls_or_prog": True,
         },
-    ]
-
-    if has_cookies:
-        profiles.extend([
-            {
-                "name": "tv_authenticated",
-                "use_cookies": True,
-                "clients": ["tv", "tv_embedded"],
-                "prefer_hls_or_prog": False,
-            },
-            {
-                "name": "web_safari_authenticated",
-                "use_cookies": True,
-                "clients": ["web_safari"],
-                "prefer_hls_or_prog": True,
-            },
-            {
-                "name": "web_creator_authenticated",
-                "use_cookies": True,
-                "clients": ["web_creator"],
-                "prefer_hls_or_prog": False,
-            },
-            {
-                "name": "mweb_authenticated",
-                "use_cookies": True,
-                "clients": ["mweb", "web"],
-                "prefer_hls_or_prog": False,
-            },
-        ])
-
-    profiles.extend([
         {
-            "name": "tv_embedded_direct",
+            "name": "tv_samsung_direct",
             "use_cookies": False,
-            "clients": ["tv_embedded", "web_safari"],
-            "prefer_hls_or_prog": True,
+            "clients": ["tv_samsung"],
+            "prefer_hls_or_prog": False,
         },
         {
-            "name": "android_mediaconnect",
+            "name": "web_safari_direct",
             "use_cookies": False,
-            "clients": ["android", "mediaconnect"],
-            "prefer_hls_or_prog": False,
+            "clients": ["web_safari"],
+            "prefer_hls_or_prog": True,
         },
     ])
     return profiles
@@ -482,33 +503,50 @@ def slice_hls_playlist_to_file(
     if "User-Agent" not in req_headers:
         req_headers["User-Agent"] = "com.google.ios.youtube/19.45.4 (iPhone16,2; U; CPU iOS 18_1 like Mac OS X;)"
 
-    def _fetch_bytes(target_url: str) -> bytes:
-        req = urllib.request.Request(target_url, headers=req_headers)
+    def _fetch_bytes(target_url: str, byte_range: Optional[str] = None) -> bytes:
+        hdrs = dict(req_headers)
+        if byte_range:
+            hdrs["Range"] = f"bytes={byte_range}"
+        req = urllib.request.Request(target_url, headers=hdrs)
         with urllib.request.urlopen(req, timeout=20) as resp:
             return resp.read()
 
     raw_m3u8 = _fetch_bytes(m3u8_url).decode("utf-8", errors="replace")
     lines = [l.strip() for l in raw_m3u8.splitlines() if l.strip()]
 
-    # If this is a master playlist (#EXT-X-STREAM-INF), resolve the media playlist URL first
+    # If this is a master playlist (#EXT-X-STREAM-INF), resolve a media playlist URL first
     for idx, line in enumerate(lines):
-        if line.startswith("#EXT-X-STREAM-INF") and idx + 1 < len(lines):
-            sub_url = urllib.parse.urljoin(m3u8_url, lines[idx + 1])
-            raw_m3u8 = _fetch_bytes(sub_url).decode("utf-8", errors="replace")
-            m3u8_url = sub_url
-            lines = [l.strip() for l in raw_m3u8.splitlines() if l.strip()]
+        if line.startswith("#EXT-X-STREAM-INF"):
+            for nxt in lines[idx + 1:]:
+                if not nxt.startswith("#"):
+                    sub_url = urllib.parse.urljoin(m3u8_url, nxt)
+                    raw_m3u8 = _fetch_bytes(sub_url).decode("utf-8", errors="replace")
+                    m3u8_url = sub_url
+                    lines = [l.strip() for l in raw_m3u8.splitlines() if l.strip()]
+                    break
             break
 
     init_map_url: Optional[str] = None
-    segments_meta: List[Tuple[float, float, str]] = []  # (seg_start, seg_end, seg_url)
+    segments_meta: List[Tuple[float, float, str, Optional[str]]] = []  # (start, end, url, range)
     cur_t = 0.0
     pending_dur: Optional[float] = None
+    pending_range: Optional[str] = None
+    next_range_offset = 0
 
     for line in lines:
         if line.startswith("#EXT-X-MAP:"):
             m_uri = re.search(r'URI="([^"]+)"', line)
             if m_uri:
                 init_map_url = urllib.parse.urljoin(m3u8_url, m_uri.group(1))
+        elif line.startswith("#EXT-X-BYTERANGE:"):
+            br_spec = line[len("#EXT-X-BYTERANGE:"):].strip()
+            if "@" in br_spec:
+                length_s, off_s = br_spec.split("@", 1)
+                length_i, off_i = int(length_s), int(off_s)
+            else:
+                length_i, off_i = int(br_spec), next_range_offset
+            pending_range = f"{off_i}-{off_i + length_i - 1}"
+            next_range_offset = off_i + length_i
         elif line.startswith("#EXTINF:"):
             dur_str = line[len("#EXTINF:"):].split(",")[0].strip()
             try:
@@ -518,9 +556,10 @@ def slice_hls_playlist_to_file(
         elif not line.startswith("#"):
             seg_dur = pending_dur if pending_dur is not None else 5.0
             seg_url = urllib.parse.urljoin(m3u8_url, line)
-            segments_meta.append((cur_t, cur_t + seg_dur, seg_url))
+            segments_meta.append((cur_t, cur_t + seg_dur, seg_url, pending_range))
             cur_t += seg_dur
             pending_dur = None
+            pending_range = None
 
     if not segments_meta:
         raise ValueError("HLS playlist contained no media segments.")
@@ -529,7 +568,7 @@ def slice_hls_playlist_to_file(
     pad_start = max(0.0, start_time - 1.0)
     pad_end = end_time + 1.0
     overlapping = [
-        (s0, s1, u) for (s0, s1, u) in segments_meta
+        (s0, s1, u, rng) for (s0, s1, u, rng) in segments_meta
         if s1 > pad_start and s0 < pad_end
     ]
     if not overlapping:
@@ -548,18 +587,90 @@ def slice_hls_playlist_to_file(
             out_f.write(init_data)
             downloaded_bytes += len(init_data)
 
-        for idx, (_, _, seg_url) in enumerate(overlapping, start=1):
-            chunk = _fetch_bytes(seg_url)
+        for idx, (_, _, seg_url, seg_rng) in enumerate(overlapping, start=1):
+            chunk = _fetch_bytes(seg_url, byte_range=seg_rng)
             out_f.write(chunk)
             downloaded_bytes += len(chunk)
             if progress_callback:
-                pct = min(0.95, idx / max(1, total_segs))
+                pct = max(0.0, min(0.95, idx / max(1, total_segs)))
                 progress_callback(
                     pct,
                     f"Direct HLS Slice: {format_bytes(downloaded_bytes)} (segment {idx}/{total_segs})",
                 )
 
     return output_ts_path, local_offset
+
+
+def _is_hls_format(f: Dict[str, Any]) -> bool:
+    url_str = str(f.get("url") or "")
+    proto_str = str(f.get("protocol") or "")
+    return bool(url_str) and ("m3u8" in proto_str or ".m3u8" in url_str)
+
+
+def _select_hls_formats(
+    formats: List[Dict[str, Any]],
+    max_height: int,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """
+    Pick either a muxed HLS format OR a (video_hls, audio_hls) pair within `max_height`.
+    Prefers H.264 (`avc1`) video for broad browser playback and fast FFmpeg decoding.
+    """
+    muxed = [
+        f for f in formats
+        if _is_hls_format(f)
+        and f.get("vcodec") not in (None, "none")
+        and f.get("acodec") not in (None, "none")
+    ]
+    muxed_capped = [f for f in muxed if (f.get("height") or 0) <= max_height] or muxed
+    if muxed_capped:
+        muxed_capped.sort(
+            key=lambda f: (
+                (f.get("height") or 0) <= max_height,
+                f.get("height") or 0,
+                1 if str(f.get("vcodec", "")).startswith("avc") else 0,
+                f.get("tbr") or 0,
+            ),
+            reverse=True,
+        )
+        return muxed_capped[0], None, None
+
+    v_hls = [
+        f for f in formats
+        if _is_hls_format(f)
+        and f.get("vcodec") not in (None, "none")
+        and (f.get("height") or 0) > 0
+    ]
+    a_hls = [
+        f for f in formats
+        if _is_hls_format(f)
+        and f.get("vcodec") == "none"
+        and (
+            f.get("acodec") not in (None, "none")
+            or str(f.get("format_id", "")) in ("233", "234")
+            or "audio" in str(f.get("format_note", "")).lower()
+        )
+    ]
+    if not v_hls or not a_hls:
+        return None, None, None
+
+    v_capped = [f for f in v_hls if (f.get("height") or 0) <= max_height] or v_hls
+    v_capped.sort(
+        key=lambda f: (
+            (f.get("height") or 0) <= max_height,
+            f.get("height") or 0,
+            1 if str(f.get("vcodec", "")).startswith("avc") else 0,
+            f.get("tbr") or 0,
+        ),
+        reverse=True,
+    )
+    a_hls.sort(
+        key=lambda f: (
+            1 if str(f.get("format_id", "")) == "234" else 0,
+            f.get("abr") or f.get("tbr") or 0,
+        ),
+        reverse=True,
+    )
+    return None, v_capped[0], a_hls[0]
 
 
 def _try_python_hls_direct_slice(
@@ -572,16 +683,26 @@ def _try_python_hls_direct_slice(
     progress_callback: Optional[Callable[[float, str], None]] = None,
 ) -> Optional[Path]:
     """
-    Attempt to extract an HLS `.m3u8` stream URL via `yt-dlp` (`ios` / `web_safari` / `tv`)
-    and slice ONLY the target timestamp segments in Python, then trim & crop locally with FFmpeg.
+    Attempt to extract HLS `.m3u8` stream URLs via `yt-dlp` (`visionos`, `default`,
+    `web_safari`), download ONLY the overlapping segments in Python (supports both
+    muxed HLS and separate video+audio HLS), and trim/mux/crop locally with FFmpeg.
     """
     import yt_dlp
 
-    hls_profiles = [
-        {"use_cookies": False, "clients": ["ios"]},
-        {"use_cookies": True, "clients": ["web_safari", "tv"]},
-        {"use_cookies": False, "clients": ["web_safari", "tv_embedded"]},
+    has_cookies = bool(get_yt_cookies_file())
+    hls_profiles: List[Dict[str, Any]] = [
+        {"use_cookies": False, "clients": ["visionos"]},
+        {"use_cookies": False, "clients": None},
     ]
+    if has_cookies:
+        hls_profiles.extend([
+            {"use_cookies": True, "clients": ["web_safari"]},
+            {"use_cookies": True, "clients": None},
+        ])
+    hls_profiles.append({"use_cookies": False, "clients": ["web_safari"]})
+
+    js_runtimes = get_js_runtimes()
+    ffmpeg_exe = ensure_ffmpeg()
 
     for prof in hls_profiles:
         ydl_opts: Dict[str, Any] = {
@@ -590,14 +711,17 @@ def _try_python_hls_direct_slice(
             "skip_download": True,
             "cachedir": False,
             "nocheckcertificate": True,
+            "source_address": "0.0.0.0",
             "socket_timeout": 20,
-            "js_runtimes": {"node": {}, "deno": {}},
-            "extractor_args": {
+            "js_runtimes": js_runtimes,
+            "remote_components": ["ejs:github"],
+        }
+        if prof.get("clients"):
+            ydl_opts["extractor_args"] = {
                 "youtube": {
                     "player_client": prof["clients"],
                 }
-            },
-        }
+            }
         if prof["use_cookies"]:
             cf = get_yt_cookies_file()
             if cf and Path(cf).exists():
@@ -609,58 +733,101 @@ def _try_python_hls_direct_slice(
             if not info or not isinstance(info.get("formats"), list):
                 continue
 
-            formats = info["formats"]
-            # Find HLS formats with both video and audio (or m3u8 formats) <= max_height
-            hls_candidates = [
-                f for f in formats
-                if f.get("url")
-                and ("m3u8" in str(f.get("protocol", "")) or ".m3u8" in str(f.get("url", "")))
-                and f.get("vcodec") != "none"
-                and f.get("acodec") != "none"
-                and (f.get("height") or 0) <= max_height
-            ]
-            if not hls_candidates:
-                hls_candidates = [
-                    f for f in formats
-                    if f.get("url")
-                    and ("m3u8" in str(f.get("protocol", "")) or ".m3u8" in str(f.get("url", "")))
-                    and f.get("vcodec") != "none"
-                    and f.get("acodec") != "none"
-                ]
-            if not hls_candidates:
-                continue
+            muxed_fmt, v_fmt, a_fmt = _select_hls_formats(info["formats"], max_height)
+            clip_dur = max(0.5, end_time - start_time)
 
-            hls_candidates.sort(key=lambda f: (f.get("height") or 0, f.get("tbr") or 0), reverse=True)
-            chosen_fmt = hls_candidates[0]
-            m3u8_url = chosen_fmt["url"]
-            fmt_headers = chosen_fmt.get("http_headers") or info.get("http_headers") or {}
-
-            temp_ts = output_path.with_name(f"_hls_slice_{output_path.stem}.ts")
-            _, local_offset = slice_hls_playlist_to_file(
-                m3u8_url=m3u8_url,
-                output_ts_path=temp_ts,
-                start_time=start_time,
-                end_time=end_time,
-                headers=fmt_headers,
-                progress_callback=progress_callback,
-            )
-
-            if temp_ts.exists() and temp_ts.stat().st_size > 0:
-                clip_dur = max(0.5, end_time - start_time)
-                trim_clip_ffmpeg(
-                    source_video=temp_ts,
-                    output_path=output_path,
-                    start_time=local_offset,
-                    end_time=local_offset + clip_dur,
-                    fast_copy=False,
-                    crop_config=crop_config,
-                )
+            if muxed_fmt:
+                fmt_headers = muxed_fmt.get("http_headers") or info.get("http_headers") or {}
+                temp_ts = output_path.with_name(f"_hls_slice_{output_path.stem}.ts")
                 try:
-                    temp_ts.unlink()
-                except Exception:
-                    pass
-                if output_path.exists() and output_path.stat().st_size > 0:
-                    return output_path
+                    _, local_offset = slice_hls_playlist_to_file(
+                        m3u8_url=muxed_fmt["url"],
+                        output_ts_path=temp_ts,
+                        start_time=start_time,
+                        end_time=end_time,
+                        headers=fmt_headers,
+                        progress_callback=progress_callback,
+                    )
+                    if temp_ts.exists() and temp_ts.stat().st_size > 0:
+                        trim_clip_ffmpeg(
+                            source_video=temp_ts,
+                            output_path=output_path,
+                            start_time=local_offset,
+                            end_time=local_offset + clip_dur,
+                            fast_copy=False,
+                            crop_config=crop_config,
+                        )
+                        if output_path.exists() and output_path.stat().st_size > 0:
+                            return output_path
+                finally:
+                    try:
+                        if temp_ts.exists():
+                            temp_ts.unlink()
+                    except Exception:
+                        pass
+
+            elif v_fmt and a_fmt and ffmpeg_exe:
+                v_headers = v_fmt.get("http_headers") or info.get("http_headers") or {}
+                a_headers = a_fmt.get("http_headers") or info.get("http_headers") or {}
+                temp_v = output_path.with_name(f"_hls_v_{output_path.stem}.ts")
+                temp_a = output_path.with_name(f"_hls_a_{output_path.stem}.ts")
+                try:
+                    _, v_off = slice_hls_playlist_to_file(
+                        m3u8_url=v_fmt["url"],
+                        output_ts_path=temp_v,
+                        start_time=start_time,
+                        end_time=end_time,
+                        headers=v_headers,
+                        progress_callback=progress_callback,
+                    )
+                    _, a_off = slice_hls_playlist_to_file(
+                        m3u8_url=a_fmt["url"],
+                        output_ts_path=temp_a,
+                        start_time=start_time,
+                        end_time=end_time,
+                        headers=a_headers,
+                    )
+                    if (
+                        temp_v.exists() and temp_v.stat().st_size > 0
+                        and temp_a.exists() and temp_a.stat().st_size > 0
+                    ):
+                        output_path.parent.mkdir(parents=True, exist_ok=True)
+                        vf_filter = build_crop_vf_filter(crop_config)
+                        cmd = [
+                            ffmpeg_exe, "-y",
+                            "-ss", f"{v_off:.3f}", "-i", str(temp_v),
+                            "-ss", f"{a_off:.3f}", "-i", str(temp_a),
+                            "-t", f"{clip_dur:.3f}",
+                        ]
+                        if vf_filter:
+                            cmd.extend(["-vf", vf_filter])
+                        cmd.extend([
+                            "-c:v", "libx264",
+                            "-preset", "veryfast",
+                            "-crf", "23",
+                            "-pix_fmt", "yuv420p",
+                            "-c:a", "aac",
+                            "-b:a", "128k",
+                            "-shortest",
+                            "-movflags", "+faststart",
+                            str(output_path),
+                        ])
+                        proc = subprocess.run(
+                            cmd,
+                            env=get_clean_env(),
+                            stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE,
+                            text=True,
+                        )
+                        if proc.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
+                            return output_path
+                finally:
+                    for tmp_f in (temp_v, temp_a):
+                        try:
+                            if tmp_f.exists():
+                                tmp_f.unlink()
+                        except Exception:
+                            pass
         except Exception:
             continue
 
@@ -763,6 +930,72 @@ def _download_with_pytubefix(
     return None
 
 
+def _build_ydl_base_opts(
+    prof: Dict[str, Any],
+    max_height: int,
+    ffmpeg_exe: Optional[str],
+    progress_hook: Optional[Callable[[dict], None]] = None,
+) -> Dict[str, Any]:
+    """Build yt-dlp options for a player client profile with JS runtime and format prefs."""
+    opts: Dict[str, Any] = {
+        "quiet": True,
+        "no_warnings": True,
+        "no_color": True,
+        "overwrites": True,
+        "source_address": "0.0.0.0",
+        "cachedir": False,
+        "nocheckcertificate": True,
+        "retries": 5,
+        "fragment_retries": 5,
+        "file_access_retries": 3,
+        "socket_timeout": 25,
+        "downloader_args": {
+            "ffmpeg_i": ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
+        },
+        "js_runtimes": get_js_runtimes(),
+        "remote_components": ["ejs:github"],
+    }
+    if progress_hook:
+        opts["progress_hooks"] = [progress_hook]
+
+    if prof.get("clients"):
+        opts["extractor_args"] = {
+            "youtube": {
+                "player_client": prof["clients"],
+            }
+        }
+
+    if prof.get("use_cookies"):
+        fresh_cookies = get_yt_cookies_file()
+        if fresh_cookies and Path(fresh_cookies).exists():
+            opts["cookiefile"] = str(fresh_cookies)
+
+    if ffmpeg_exe and is_ffmpeg_executable(ffmpeg_exe):
+        if prof.get("prefer_hls_or_prog"):
+            format_selector = (
+                f"best[height<={max_height}][ext=mp4]/"
+                f"best[height<={max_height}]/"
+                f"bestvideo[height<={max_height}][vcodec^=avc]+bestaudio[ext=m4a]/"
+                f"bestvideo[height<={max_height}]+bestaudio/best"
+            )
+        else:
+            format_selector = (
+                f"bestvideo[height<={max_height}][vcodec^=avc]+bestaudio[ext=m4a]/"
+                f"bestvideo[height<={max_height}][ext=mp4]+bestaudio[ext=m4a]/"
+                f"best[height<={max_height}][ext=mp4]/"
+                f"bestvideo[height<={max_height}]+bestaudio/"
+                f"best[height<={max_height}]/best"
+            )
+        opts["format"] = format_selector
+        opts["ffmpeg_location"] = str(ffmpeg_exe)
+        opts["merge_output_format"] = "mp4"
+    else:
+        opts["format"] = (
+            f"best[height<={max_height}][ext=mp4]/best[height<={max_height}]/best[ext=mp4]/best"
+        )
+    return opts
+
+
 def download_full_video(
     url: str,
     output_dir: Path,
@@ -786,7 +1019,7 @@ def download_full_video(
                 msg = f"Downloading video... {format_bytes(downloaded)} / {format_bytes(total)} ({int(pct * 100)}%{speed_part})"
             else:
                 msg = f"Downloading video... {format_bytes(downloaded)}{speed_part}"
-            progress_callback(min(0.99, pct), msg)
+            progress_callback(max(0.0, min(0.99, pct)), msg)
         elif progress_callback and d.get("status") == "finished":
             progress_callback(1.0, "Download finished, finalizing container...")
 
@@ -805,59 +1038,12 @@ def download_full_video(
             except Exception:
                 pass
 
-        ydl_opts: Dict[str, Any] = {
+        ydl_opts = _build_ydl_base_opts(prof, max_height, ffmpeg_exe, progress_hook=_hook)
+        ydl_opts.update({
             "outtmpl": outtmpl,
-            "quiet": True,
-            "no_warnings": True,
-            "no_color": True,
-            "overwrites": True,
             "continuedl": True,
-            "source_address": "0.0.0.0",
-            "cachedir": False,
-            "nocheckcertificate": True,
-            "retries": 5,
-            "fragment_retries": 5,
-            "file_access_retries": 3,
-            "socket_timeout": 25,
             "http_chunk_size": 10485760,
-            "progress_hooks": [_hook],
-            "downloader_args": {
-                "ffmpeg_i": ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
-            },
-            "js_runtimes": {"node": {}, "deno": {}},
-            "extractor_args": {
-                "youtube": {
-                    "player_client": prof["clients"],
-                }
-            },
-        }
-
-        if prof["use_cookies"]:
-            fresh_cookies = get_yt_cookies_file()
-            if fresh_cookies and Path(fresh_cookies).exists():
-                ydl_opts["cookiefile"] = str(fresh_cookies)
-
-        if ffmpeg_exe and is_ffmpeg_executable(ffmpeg_exe):
-            if prof.get("prefer_hls_or_prog"):
-                format_selector = (
-                    f"best[height<={max_height}][ext=mp4]/"
-                    f"best[height<={max_height}]/"
-                    f"bestvideo[height<={max_height}]+bestaudio/best"
-                )
-            else:
-                format_selector = (
-                    f"best[height<={max_height}][ext=mp4]/"
-                    f"bestvideo[height<={max_height}][ext=mp4]+bestaudio[ext=m4a]/"
-                    f"bestvideo[height<={max_height}]+bestaudio/"
-                    f"best[height<={max_height}]/best"
-                )
-            ydl_opts["format"] = format_selector
-            ydl_opts["ffmpeg_location"] = str(ffmpeg_exe)
-            ydl_opts["merge_output_format"] = "mp4"
-        else:
-            ydl_opts["format"] = (
-                f"best[height<={max_height}][ext=mp4]/best[height<={max_height}]/best[ext=mp4]/best"
-            )
+        })
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -904,11 +1090,11 @@ def download_single_clip_section(
     from YouTube, then optionally apply local FFmpeg cropping (`crop_config`).
 
     3-Tier Cloud-Resilient Architecture:
-    1. Tier 1 (`_try_python_hls_direct_slice`): Fetches the HLS `.m3u8` playlist in Python,
-       downloads ONLY the overlapping `.ts` segments in Python (never spawning FFmpeg over HTTP),
-       and runs FFmpeg purely locally to trim & crop. Eliminates `ffmpeg exited with code 8`!
-    2. Tier 2 (`yt-dlp` section download with isolated single-client profiles & native headers).
-    3. Tier 3 (`pytubefix` progressive stream fallback + local FFmpeg trim & crop).
+    1. Tier 1 (`_try_python_hls_direct_slice`): Fetches HLS `.m3u8` playlists in Python,
+       downloads ONLY overlapping segments in Python (never spawning FFmpeg over HTTP),
+       and runs FFmpeg purely locally to mux, trim & crop. Eliminates `ffmpeg exited with code 8`!
+    2. Tier 2 (`yt-dlp` section download with isolated client profiles & JS challenge solver).
+    3. Tier 3 (`pytubefix` progressive/adaptive fallback + local FFmpeg trim & crop).
     """
     output_path.parent.mkdir(parents=True, exist_ok=True)
     ffmpeg_exe = ensure_ffmpeg()
@@ -938,7 +1124,7 @@ def download_single_clip_section(
                 msg = f"Direct Stream-Trim: {format_bytes(downloaded)} / {format_bytes(total)} ({int(pct * 100)}%{speed_part})"
             else:
                 msg = f"Direct Stream-Trim: {format_bytes(downloaded)}{speed_part}"
-            progress_callback(min(0.99, pct), msg)
+            progress_callback(max(0.0, min(0.99, pct)), msg)
         elif progress_callback and d.get("status") == "finished":
             progress_callback(1.0, "Stream downloaded, finalizing MP4 clip...")
 
@@ -959,50 +1145,15 @@ def download_single_clip_section(
             except Exception:
                 pass
 
-        ydl_opts: Dict[str, Any] = {
+        ydl_opts = _build_ydl_base_opts(prof, max_height, ffmpeg_exe, progress_hook=_hook)
+        ydl_opts.update({
             "outtmpl": outtmpl,
-            "quiet": True,
-            "no_warnings": True,
-            "no_color": True,
-            "overwrites": True,
-            "source_address": "0.0.0.0",
-            "cachedir": False,
-            "nocheckcertificate": True,
             "download_ranges": yt_dlp.utils.download_range_func(None, [(start_time, end_time)]),
             "force_keyframes_at_cuts": False,
             "retries": 4,
             "fragment_retries": 4,
             "socket_timeout": 20,
-            "progress_hooks": [_hook],
-            "downloader_args": {
-                "ffmpeg_i": ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]
-            },
-            "js_runtimes": {"node": {}, "deno": {}},
-            "extractor_args": {
-                "youtube": {
-                    "player_client": prof["clients"],
-                }
-            },
-        }
-
-        if prof["use_cookies"]:
-            fresh_cookies = get_yt_cookies_file()
-            if fresh_cookies and Path(fresh_cookies).exists():
-                ydl_opts["cookiefile"] = str(fresh_cookies)
-
-        if ffmpeg_exe and is_ffmpeg_executable(ffmpeg_exe):
-            ydl_opts["ffmpeg_location"] = str(ffmpeg_exe)
-            ydl_opts["merge_output_format"] = "mp4"
-            ydl_opts["format"] = (
-                f"best[height<={max_height}][ext=mp4]/"
-                f"best[height<={max_height}]/"
-                f"bestvideo[height<={max_height}][ext=mp4]+bestaudio[ext=m4a]/"
-                f"best"
-            )
-        else:
-            ydl_opts["format"] = (
-                f"best[height<={max_height}][ext=mp4]/best[height<={max_height}]/best"
-            )
+        })
 
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -1061,6 +1212,29 @@ def download_single_clip_section(
         except Exception as exc:
             last_exc = exc
             continue
+
+    # Tier 3: pytubefix fallback + local FFmpeg trim/crop
+    try:
+        with tempfile.TemporaryDirectory() as pt_tmp:
+            pt_path = _download_with_pytubefix(
+                url=url,
+                output_dir=Path(pt_tmp),
+                max_height=max_height,
+                progress_callback=progress_callback,
+            )
+            if pt_path and pt_path.exists() and pt_path.stat().st_size > 0:
+                trim_clip_ffmpeg(
+                    source_video=pt_path,
+                    output_path=output_path,
+                    start_time=start_time,
+                    end_time=end_time,
+                    fast_copy=False,
+                    crop_config=crop_config,
+                )
+                if output_path.exists() and output_path.stat().st_size > 0:
+                    return output_path
+    except Exception:
+        pass
 
     if last_exc:
         raise last_exc

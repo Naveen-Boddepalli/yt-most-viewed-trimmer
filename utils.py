@@ -3,9 +3,56 @@
 import json
 import os
 import re
+import shutil
 import tempfile
 from pathlib import Path
 from typing import Tuple, Optional, Dict, Any
+
+
+def get_js_runtimes() -> Dict[str, Dict[str, str]]:
+    """
+    Locate installed JavaScript runtimes (Node.js / Deno) for yt-dlp's EJS
+    signature & n-challenge solver. Returns a dict suitable for `ydl_opts['js_runtimes']`.
+    """
+    runtimes: Dict[str, Dict[str, str]] = {}
+
+    node_candidates = [
+        shutil.which("node"),
+        shutil.which("nodejs"),
+        "/usr/bin/node",
+        "/usr/bin/nodejs",
+        "/usr/local/bin/node",
+        "/opt/homebrew/bin/node",
+    ]
+    for cand in node_candidates:
+        if cand and Path(cand).is_file():
+            runtimes["node"] = {"path": str(cand)}
+            break
+    if "node" not in runtimes:
+        runtimes["node"] = {}
+
+    deno_candidates = []
+    try:
+        import deno as deno_pkg
+        deno_bin = deno_pkg.find_deno_bin()
+        if deno_bin:
+            deno_candidates.append(deno_bin)
+    except Exception:
+        pass
+    deno_candidates.extend([
+        shutil.which("deno"),
+        "/usr/local/bin/deno",
+        "/opt/homebrew/bin/deno",
+        str(Path.home() / ".deno" / "bin" / "deno"),
+    ])
+    for cand in deno_candidates:
+        if cand and Path(cand).is_file():
+            runtimes["deno"] = {"path": str(cand)}
+            break
+    if "deno" not in runtimes:
+        runtimes["deno"] = {}
+
+    return runtimes
 
 
 def sanitize_environment() -> None:
@@ -54,21 +101,28 @@ def get_clean_env() -> Dict[str, str]:
 sanitize_environment()
 
 
+def _parse_cookie_expiry(raw_exp: Any) -> int:
+    try:
+        val = int(float(raw_exp))
+        return val if val >= 0 else 1999999999
+    except Exception:
+        return 1999999999
+
+
 def sanitize_cookie_content(content: str) -> str:
     """
     Ensure the cookie content has the proper Netscape HTTP Cookie File format for yt-dlp.
-    Supports both Netscape format and JSON cookie exports (e.g. Cookie-Editor / EditThisCookie).
-    1. Converts JSON cookie arrays to Netscape format automatically if detected.
-    2. Removes malformed lines that crash MozillaCookieJar.
-    3. Converts spaces to tabs.
-    4. If a cookie has 6 columns (value is empty), appends an empty string as the 7th column.
-    5. Drops any lines with fewer than 6 columns.
-    6. Preserves valid comments and ensures Netscape header.
+    Supports:
+    1. Netscape format (standard and #HttpOnly_ prefixes)
+    2. JSON cookie arrays (Cookie-Editor / EditThisCookie)
+    3. Chrome/Edge DevTools multi-column table copy-paste
+    4. Semicolon-separated key=value strings (Cookie header or document.cookie)
+    5. Two-column name/value lines or alternating Name/Value lines
     """
     cleaned = content.strip().strip("\"'`")
     lines = []
 
-    # Check if user pasted JSON-formatted cookies from a browser extension
+    # 1. JSON cookie array
     if cleaned.startswith("[") and cleaned.endswith("]"):
         try:
             cookie_list = json.loads(cleaned)
@@ -76,13 +130,11 @@ def sanitize_cookie_content(content: str) -> str:
                 for item in cookie_list:
                     if not isinstance(item, dict):
                         continue
-                    domain = str(item.get("domain", ".youtube.com")).strip()
-                    if not domain:
-                        continue
+                    domain = str(item.get("domain", ".youtube.com")).strip() or ".youtube.com"
                     include_sub = "TRUE" if domain.startswith(".") else "FALSE"
                     path = str(item.get("path", "/")).strip() or "/"
                     secure = "TRUE" if item.get("secure", True) else "FALSE"
-                    exp = int(item.get("expirationDate") or item.get("expiry") or 1999999999)
+                    exp = _parse_cookie_expiry(item.get("expirationDate") or item.get("expiry"))
                     name = str(item.get("name", "")).strip()
                     val = str(item.get("value", "")).strip()
                     if name:
@@ -90,6 +142,7 @@ def sanitize_cookie_content(content: str) -> str:
         except Exception:
             lines = []
 
+    # 2. Netscape format (strict field validation so DevTools rows aren't misread)
     if not lines:
         for raw_line in cleaned.splitlines():
             line = raw_line.strip()
@@ -107,15 +160,58 @@ def sanitize_cookie_content(content: str) -> str:
                 sp = re.split(r"\s+", line)
                 if len(sp) >= 6:
                     parts = sp
-            # If line has only 6 columns (empty value), add empty value as 7th column
             if len(parts) == 6:
                 parts.append("")
-            if len(parts) >= 7:
+            if (
+                len(parts) >= 7
+                and parts[1].upper() in ("TRUE", "FALSE")
+                and parts[3].upper() in ("TRUE", "FALSE")
+                and re.match(r"^\d+(?:\.\d+)?$", parts[4])
+            ):
+                exp_int = str(_parse_cookie_expiry(parts[4]))
                 val = "\t".join(parts[6:])
-                fixed = "\t".join(parts[:6] + [val])
+                fixed = "\t".join([parts[0], parts[1].upper(), parts[2], parts[3].upper(), exp_int, parts[5], val])
                 lines.append(fixed)
-            else:
-                continue
+            elif (
+                len(parts) >= 4
+                and re.match(r"^[A-Za-z0-9_\-\.\:\+]+$", parts[0])
+                and ("youtube.com" in parts[2] or "google.com" in parts[2])
+            ):
+                # Chrome/Edge DevTools Cookies table row: name, value, domain, path, ...
+                domain = parts[2].strip() or ".youtube.com"
+                include_sub = "TRUE" if domain.startswith(".") else "FALSE"
+                path = (parts[3].strip() if len(parts) > 3 else "/") or "/"
+                if not path.startswith("/"):
+                    path = "/"
+                lines.append(f"{domain}\t{include_sub}\t{path}\tTRUE\t1999999999\t{parts[0].strip()}\t{parts[1].strip()}")
+
+    # 3. Fallback: semicolon-separated key=value pairs (Cookie header or document.cookie)
+    cookie_entries = [l for l in lines if not l.startswith("#")]
+    if not cookie_entries and ";" in cleaned and "=" in cleaned:
+        cleaned_no_hdr = re.sub(r"^[Cc]ookie:\s*", "", cleaned)
+        for pair in cleaned_no_hdr.split(";"):
+            pair = pair.strip()
+            if "=" in pair:
+                k, v = pair.split("=", 1)
+                k, v = k.strip(), v.strip()
+                if k and re.match(r"^[A-Za-z0-9_\-\.\:\+]+$", k):
+                    lines.append(f".youtube.com\tTRUE\t/\tTRUE\t1999999999\t{k}\t{v}")
+
+    # 4. Fallback: 2-column or DevTools alternating lines (Name then Value)
+    cookie_entries = [l for l in lines if not l.startswith("#")]
+    if not cookie_entries:
+        raw_non_empty = [l.strip() for l in cleaned.splitlines() if l.strip() and not l.strip().startswith("#")]
+        for rline in raw_non_empty:
+            parts = re.split(r"[\t\s]+", rline, maxsplit=1)
+            if len(parts) == 2 and re.match(r"^[A-Za-z0-9_\-\.\:\+]+$", parts[0]):
+                lines.append(f".youtube.com\tTRUE\t/\tTRUE\t1999999999\t{parts[0]}\t{parts[1]}")
+        cookie_entries = [l for l in lines if not l.startswith("#")]
+        if not cookie_entries and len(raw_non_empty) >= 2 and len(raw_non_empty) % 2 == 0:
+            for i in range(0, len(raw_non_empty), 2):
+                k = raw_non_empty[i]
+                v = raw_non_empty[i + 1]
+                if re.match(r"^[A-Za-z0-9_\-\.\:\+]+$", k):
+                    lines.append(f".youtube.com\tTRUE\t/\tTRUE\t1999999999\t{k}\t{v}")
 
     has_header = any("# Netscape HTTP Cookie File" in l for l in lines[:5])
     if not has_header:
@@ -140,18 +236,54 @@ def _write_working_cookie_copy(sanitized_content: str) -> str:
     return str(work_cf.resolve())
 
 
+def save_yt_cookies(content: str) -> str:
+    """Sanitize and persist user cookies to disk (CWD with tempdir fallback)."""
+    sanitized = sanitize_cookie_content(content)
+    for target in (Path("user_cookies.txt"), Path(tempfile.gettempdir()) / "user_cookies.txt"):
+        try:
+            target.write_text(sanitized, encoding="utf-8")
+            return sanitized
+        except Exception:
+            continue
+    return sanitized
+
+
+def clear_yt_cookies() -> None:
+    """Remove persisted and working cookie files from disk and tempdir."""
+    for p in (
+        Path("user_cookies.txt"),
+        Path("cookies.txt"),
+        Path(tempfile.gettempdir()) / "user_cookies.txt",
+        Path(tempfile.gettempdir()) / "env_cookies.txt",
+    ):
+        try:
+            if p.exists():
+                p.unlink()
+        except Exception:
+            pass
+    for tmp_f in Path(tempfile.gettempdir()).glob("*cookies*.txt"):
+        try:
+            tmp_f.unlink()
+        except Exception:
+            pass
+
+
 def get_yt_cookies_file() -> Optional[str]:
     """
     Check if YouTube cookies are available from:
-    1. Persistent user_cookies.txt or local cookies.txt
+    1. Persistent user_cookies.txt or local cookies.txt (CWD or tempdir)
     2. /tmp/env_cookies.txt
     3. Streamlit secrets (st.secrets["YOUTUBE_COOKIES"])
     4. Streamlit session_state (user pasted in sidebar)
     Returns the resolved string path to an isolated working cookie file or None.
     """
     # 1. Check persistent user_cookies.txt or cookies.txt on disk
-    for fname in ["user_cookies.txt", "cookies.txt"]:
-        p = Path(fname)
+    disk_candidates = [
+        Path("user_cookies.txt"),
+        Path("cookies.txt"),
+        Path(tempfile.gettempdir()) / "user_cookies.txt",
+    ]
+    for p in disk_candidates:
         if p.exists() and p.stat().st_size > 0:
             try:
                 raw = p.read_text(encoding="utf-8")
@@ -205,12 +337,10 @@ def get_cookie_stats() -> Dict[str, Any]:
     try:
         cj.load(ignore_discard=True, ignore_expires=True)
         names = [c.name for c in cj]
-        yt_cookies = [c for c in cj if "youtube" in getattr(c, "domain", "") or "google" in getattr(c, "domain", "")]
-        auth_keys = [
-            "SID", "HSID", "SSID", "LOGIN_INFO",
-            "__Secure-3PSID", "__Secure-1PSID", "SAPISID", "APISID", "__Secure-3PAPISID"
-        ]
-        has_auth = any(n in names for n in auth_keys)
+        yt_cookies = [c for c in cj if "youtube.com" in getattr(c, "domain", "")]
+        yt_names = {c.name for c in yt_cookies}
+        # True YouTube session authentication requires LOGIN_INFO, __Secure-1PSID, __Secure-3PSID, or SAPISID on .youtube.com
+        has_auth = bool({"LOGIN_INFO", "__Secure-1PSID", "__Secure-3PSID", "SAPISID"} & yt_names)
         return {
             "active": len(cj) > 0,
             "count": len(cj),

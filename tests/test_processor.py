@@ -20,6 +20,7 @@ from utils import (
     sanitize_cookie_content,
     sanitize_environment,
     get_clean_env,
+    get_js_runtimes,
 )
 from yt_processor import (
     extract_most_viewed_segments,
@@ -42,6 +43,7 @@ from video_trimmer import (
     trim_selected_segments,
     create_clips_zip,
     _build_client_profiles,
+    _select_hls_formats,
     get_video_dimensions,
     slice_hls_playlist_to_file,
 )
@@ -249,8 +251,12 @@ class TestYouTubeMostViewedTrimmer(unittest.TestCase):
     def test_client_profiles_and_cookie_isolation(self):
         profiles = _build_client_profiles()
         self.assertGreaterEqual(len(profiles), 4)
+        # Ensure visionos is prioritized first to bypass datacenter bot challenges
+        self.assertEqual(profiles[0]["name"], "visionos_direct")
+        self.assertEqual(profiles[0]["clients"], ["visionos"])
         # Ensure cookieless android_vr and ios profiles exist and are separate from web
         cookieless_clients = [p["clients"] for p in profiles if not p["use_cookies"]]
+        self.assertIn(["visionos"], cookieless_clients)
         self.assertIn(["android_vr"], cookieless_clients)
         self.assertIn(["ios"], cookieless_clients)
 
@@ -273,6 +279,17 @@ class TestYouTubeMostViewedTrimmer(unittest.TestCase):
         ])
         sanitized_json = sanitize_cookie_content(json_cookies)
         self.assertIn(".youtube.com\tTRUE\t/\tTRUE\t1999999999\tLOGIN_INFO\tabc123xyz", sanitized_json)
+
+        # 3. Test DevTools alternating lines (Name \n Value)
+        devtools_paste = "ROLLOUT_TOKEN\nCMHqneCitbWR1AEQ2dGj6raRjwMYkeaQyoPeLwM%3D"
+        sanitized_devtools = sanitize_cookie_content(devtools_paste)
+        self.assertIn(".youtube.com\tTRUE\t/\tTRUE\t1999999999\tROLLOUT_TOKEN\tCMHqneCitbWR1AEQ2dGj6raRjwMYkeaQyoPeLwM%3D", sanitized_devtools)
+
+        # 4. Test Cookie header string format
+        cookie_hdr = "Cookie: LOGIN_INFO=afmm123; __Secure-1PSID=sid_val"
+        sanitized_hdr = sanitize_cookie_content(cookie_hdr)
+        self.assertIn(".youtube.com\tTRUE\t/\tTRUE\t1999999999\tLOGIN_INFO\tafmm123", sanitized_hdr)
+        self.assertIn(".youtube.com\tTRUE\t/\tTRUE\t1999999999\t__Secure-1PSID\tsid_val", sanitized_hdr)
 
     def test_sanitize_environment_and_clean_env(self):
         import os
@@ -368,6 +385,44 @@ class TestYouTubeMostViewedTrimmer(unittest.TestCase):
 
         # But for a non-existent or non-executable path, it returns False
         self.assertFalse(is_ffmpeg_executable("/nonexistent/binary/path"))
+
+    def test_select_hls_formats_separate_av_and_cookieless_guard(self):
+        # Verify visionos/android/android_vr/ios never get use_cookies=True
+        profiles = _build_client_profiles()
+        for prof in profiles:
+            clients = prof.get("clients") or []
+            if any(c in ("visionos", "android", "android_vr", "ios") for c in clients):
+                self.assertFalse(prof["use_cookies"], f"{prof['name']} must not use cookies")
+
+        # Verify separate video+audio HLS selection (visionos style) prefers avc1 H.264 <= max_height
+        sample_formats = [
+            {"format_id": "233", "protocol": "m3u8_native", "url": "https://ex/a233.m3u8", "vcodec": "none", "acodec": None, "ext": "mp4"},
+            {"format_id": "234", "protocol": "m3u8_native", "url": "https://ex/a234.m3u8", "vcodec": "none", "acodec": None, "ext": "mp4"},
+            {"format_id": "609", "protocol": "m3u8_native", "url": "https://ex/v609.m3u8", "vcodec": "vp09.00", "acodec": "none", "height": 720, "tbr": 1048},
+            {"format_id": "232", "protocol": "m3u8_native", "url": "https://ex/v232.m3u8", "vcodec": "avc1.4D401F", "acodec": "none", "height": 720, "tbr": 1248},
+            {"format_id": "270", "protocol": "m3u8_native", "url": "https://ex/v270.m3u8", "vcodec": "avc1.640028", "acodec": "none", "height": 1080, "tbr": 4688},
+        ]
+        muxed, v_fmt, a_fmt = _select_hls_formats(sample_formats, max_height=720)
+        self.assertIsNone(muxed)
+        self.assertEqual(v_fmt["format_id"], "232")
+        self.assertEqual(a_fmt["format_id"], "234")
+
+    def test_devtools_table_cookies_loadable_by_mozilla_cookie_jar(self):
+        import http.cookiejar
+        devtools_table = "LOGIN_INFO\tafmm123\t.youtube.com\t/\t2027-01-01T00:00:00.000Z\t42\t✓\t✓"
+        sanitized = sanitize_cookie_content(devtools_table)
+        self.assertIn(".youtube.com\tTRUE\t/\tTRUE\t1999999999\tLOGIN_INFO\tafmm123", sanitized)
+        with tempfile.TemporaryDirectory() as tmp:
+            cf = Path(tmp) / "c.txt"
+            cf.write_text(sanitized, encoding="utf-8")
+            cj = http.cookiejar.MozillaCookieJar(str(cf))
+            cj.load(ignore_discard=True, ignore_expires=True)
+            self.assertEqual([c.name for c in cj], ["LOGIN_INFO"])
+
+    def test_get_js_runtimes_structure(self):
+        rt = get_js_runtimes()
+        self.assertIn("node", rt)
+        self.assertIn("deno", rt)
 
 
 if __name__ == "__main__":
