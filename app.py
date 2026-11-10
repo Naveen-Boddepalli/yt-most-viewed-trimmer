@@ -950,7 +950,7 @@ if info:
                         end_time=target_seg.end_time,
                         max_height=max_resolution,
                         crop_config=None,
-                        progress_callback=lambda p, msg: prog_bar.progress(p, text=msg),
+                        progress_callback=lambda p, msg: prog_bar.progress(max(0.0, min(1.0, float(p))), text=msg),
                     )
                     prog_bar.empty()
                     st.session_state["raw_clips"][target_seg.rank] = raw_clip_path
@@ -996,7 +996,7 @@ if info:
                 if is_direct_stream_trim and not has_src and not info.get("is_demo"):
                     prog = st.progress(0.0, text="Direct streaming highlight clips (~10-15 MB each)...")
                     def _on_trim_prog(idx: int, total: int, msg: str):
-                        prog.progress(idx / total, text=msg)
+                        prog.progress(max(0.0, min(1.0, idx / max(1, total))), text=msg)
                     try:
                         trimmed_map = download_and_trim_segments_direct(
                             url=st.session_state["video_url"],
@@ -1025,7 +1025,7 @@ if info:
                     src_path = ensure_source_video()
                     prog = st.progress(0.0, text="Trimming highlight clips...")
                     def _on_trim_prog(idx: int, total: int, msg: str):
-                        prog.progress(idx / total, text=msg)
+                        prog.progress(max(0.0, min(1.0, idx / max(1, total))), text=msg)
                     trimmed_map = trim_selected_segments(
                         source_video=src_path,
                         segments=segments,

@@ -1,6 +1,7 @@
 """YouTube metadata & Most-Replayed (heatmap) timestamp extraction module."""
 
 import sys
+import warnings
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import List, Dict, Any, Optional
@@ -10,7 +11,13 @@ _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from utils import format_timestamp, get_yt_cookies_file, get_js_runtimes
+from utils import (
+    format_timestamp,
+    get_yt_cookies_file,
+    get_js_runtimes,
+    get_ytdlp_cache_dir,
+    YdlCaptureLogger,
+)
 
 
 @dataclass
@@ -72,23 +79,30 @@ def fetch_video_metadata(url: str, cookies_file: Optional[str] = None) -> Dict[s
         },
         {
             "use_cookies": False,
-            "clients": ["android_vr", "android", "tv_simply"],
+            "clients": ["web_embedded", "tv_samsung"],
+        },
+        {
+            "use_cookies": False,
+            "clients": ["android", "tv_simply"],
         },
         {
             "use_cookies": has_cookies,
-            "clients": ["tv_samsung", "web_safari"],
+            "clients": ["web_embedded", "tv_samsung"],
         },
     ])
 
+    cache_dir = get_ytdlp_cache_dir()
     last_exc: Optional[Exception] = None
     for attempt in attempts:
+        ydl_logger = YdlCaptureLogger()
         ydl_opts: Dict[str, Any] = {
             "quiet": True,
             "no_warnings": True,
+            "logger": ydl_logger,
             "skip_download": True,
             "extract_flat": False,
             "ignore_no_formats_error": True,
-            "cachedir": False,
+            "cachedir": cache_dir,
             "nocheckcertificate": True,
             "source_address": "0.0.0.0",
             "socket_timeout": 25,
@@ -116,34 +130,36 @@ def fetch_video_metadata(url: str, cookies_file: Optional[str] = None) -> Dict[s
 
     # Final fallback: try pytubefix metadata if yt-dlp is completely blocked
     try:
-        from pytubefix import YouTube
-        for pt_client in ("ANDROID_VR", "IOS", "WEB"):
-            try:
-                yt = YouTube(url, client=pt_client)
-                chapters_list = []
-                if getattr(yt, "chapters", None):
-                    for ch in yt.chapters:
-                        st_sec = float(getattr(ch, "start_seconds", 0.0))
-                        dur_sec = float(getattr(ch, "duration", 20.0))
-                        chapters_list.append({
-                            "start_time": st_sec,
-                            "end_time": st_sec + dur_sec,
-                            "title": getattr(ch, "title", "Chapter"),
-                        })
-                if yt.length or yt.title:
-                    return {
-                        "id": yt.video_id,
-                        "title": yt.title or "YouTube Video",
-                        "uploader": yt.author or "YouTube Channel",
-                        "duration": float(yt.length or 0.0),
-                        "view_count": int(yt.views or 0),
-                        "thumbnail": yt.thumbnail_url,
-                        "description": yt.description or "",
-                        "chapters": chapters_list,
-                        "heatmap": None,
-                    }
-            except Exception:
-                continue
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", SyntaxWarning)
+            from pytubefix import YouTube
+            for pt_client in ("ANDROID_VR", "IOS", "WEB"):
+                try:
+                    yt = YouTube(url, client=pt_client)
+                    chapters_list = []
+                    if getattr(yt, "chapters", None):
+                        for ch in yt.chapters:
+                            st_sec = float(getattr(ch, "start_seconds", 0.0))
+                            dur_sec = float(getattr(ch, "duration", 20.0))
+                            chapters_list.append({
+                                "start_time": st_sec,
+                                "end_time": st_sec + dur_sec,
+                                "title": getattr(ch, "title", "Chapter"),
+                            })
+                    if yt.length or yt.title:
+                        return {
+                            "id": yt.video_id,
+                            "title": yt.title or "YouTube Video",
+                            "uploader": yt.author or "YouTube Channel",
+                            "duration": float(yt.length or 0.0),
+                            "view_count": int(yt.views or 0),
+                            "thumbnail": yt.thumbnail_url,
+                            "description": yt.description or "",
+                            "chapters": chapters_list,
+                            "heatmap": None,
+                        }
+                except Exception:
+                    continue
     except Exception:
         pass
 

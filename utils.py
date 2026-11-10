@@ -6,7 +6,39 @@ import re
 import shutil
 import tempfile
 from pathlib import Path
-from typing import Tuple, Optional, Dict, Any
+from typing import Tuple, Optional, Dict, Any, List
+
+
+def get_ytdlp_cache_dir() -> str:
+    """Return a persistent temporary cache directory for yt-dlp player JS and EJS solver libs."""
+    cache_dir = Path(tempfile.gettempdir()) / "yt_dlp_cache"
+    try:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return str(cache_dir)
+    except Exception:
+        return tempfile.gettempdir()
+
+
+class YdlCaptureLogger:
+    """Quiet yt-dlp logger that captures warnings/errors in memory without spamming stderr."""
+
+    def __init__(self) -> None:
+        self.warnings: List[str] = []
+        self.errors: List[str] = []
+
+    def debug(self, msg: str) -> None:
+        pass
+
+    def info(self, msg: str) -> None:
+        pass
+
+    def warning(self, msg: str) -> None:
+        if msg:
+            self.warnings.append(str(msg))
+
+    def error(self, msg: str) -> None:
+        if msg:
+            self.errors.append(str(msg))
 
 
 def get_js_runtimes() -> Dict[str, Dict[str, str]]:

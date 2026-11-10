@@ -21,6 +21,8 @@ from utils import (
     sanitize_environment,
     get_clean_env,
     get_js_runtimes,
+    get_ytdlp_cache_dir,
+    YdlCaptureLogger,
 )
 from yt_processor import (
     extract_most_viewed_segments,
@@ -44,6 +46,9 @@ from video_trimmer import (
     create_clips_zip,
     _build_client_profiles,
     _select_hls_formats,
+    _select_https_formats,
+    _wait_for_available_at,
+    run_http_range_relay_trim,
     get_video_dimensions,
     slice_hls_playlist_to_file,
 )
@@ -423,6 +428,131 @@ class TestYouTubeMostViewedTrimmer(unittest.TestCase):
         rt = get_js_runtimes()
         self.assertIn("node", rt)
         self.assertIn("deno", rt)
+
+    def test_cache_dir_and_ydl_capture_logger(self):
+        cdir = Path(get_ytdlp_cache_dir())
+        self.assertTrue(cdir.exists() and cdir.is_dir())
+        logger = YdlCaptureLogger()
+        logger.debug("dbg")
+        logger.warning("warn1")
+        logger.error("err1")
+        self.assertEqual(logger.warnings, ["warn1"])
+        self.assertEqual(logger.errors, ["err1"])
+
+    def test_select_https_formats_and_available_at_wait(self):
+        import time
+        sample_formats = [
+            {"format_id": "sb0", "protocol": "mhtml", "url": "https://ex/sb0.jpg", "vcodec": "none", "acodec": "none"},
+            {"format_id": "311", "protocol": "m3u8_native", "url": "https://ex/311.m3u8", "vcodec": "avc1", "acodec": "none", "height": 720},
+            {"format_id": "18", "protocol": "https", "url": "https://ex/18.mp4", "vcodec": "avc1", "acodec": "mp4a", "height": 360, "ext": "mp4", "tbr": 400},
+            {"format_id": "298", "protocol": "https", "url": "https://ex/298.mp4", "vcodec": "avc1.4D4020", "acodec": "none", "height": 720, "ext": "mp4", "tbr": 1200},
+            {"format_id": "140-drc", "protocol": "https", "url": "https://ex/140drc.m4a", "vcodec": "none", "acodec": "mp4a", "ext": "m4a", "abr": 128},
+            {"format_id": "140", "protocol": "https", "url": "https://ex/140.m4a", "vcodec": "none", "acodec": "mp4a", "ext": "m4a", "abr": 128},
+        ]
+        prog, v_fmt, a_fmt = _select_https_formats(sample_formats, max_height=720)
+        self.assertIsNone(prog)
+        self.assertEqual(v_fmt["format_id"], "298")
+        self.assertEqual(a_fmt["format_id"], "140")
+
+        prog_360, v_360, a_360 = _select_https_formats(sample_formats, max_height=360)
+        self.assertEqual(prog_360["format_id"], "18")
+        self.assertIsNone(v_360)
+        self.assertIsNone(a_360)
+
+        self.assertTrue(_wait_for_available_at([{"available_at": time.time() - 5}]))
+        self.assertFalse(_wait_for_available_at([{"available_at": time.time() + 120}], max_wait=5.0))
+
+    def test_http_range_relay_trim_end_to_end(self):
+        if not has_ffmpeg():
+            self.skipTest("FFmpeg not installed")
+        import http.server
+        import socketserver
+        import threading
+        import urllib.request
+
+        ffmpeg_exe = ensure_ffmpeg()
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            src_mp4 = tmp_path / "src_relay.mp4"
+            subprocess.run(
+                [
+                    ffmpeg_exe, "-y",
+                    "-f", "lavfi", "-i", "testsrc=duration=6:size=640x360:rate=15",
+                    "-f", "lavfi", "-i", "sine=frequency=440:duration=6",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+                    "-c:a", "aac", "-movflags", "+faststart", "-shortest",
+                    str(src_mp4),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+            data = src_mp4.read_bytes()
+
+            class _RangeServerHandler(http.server.BaseHTTPRequestHandler):
+                def log_message(self, *args):
+                    pass
+
+                def do_GET(self):
+                    rng = self.headers.get("Range")
+                    if rng and rng.startswith("bytes="):
+                        spec = rng[len("bytes="):]
+                        start_s, end_s = spec.split("-", 1)
+                        start_i = int(start_s) if start_s else 0
+                        end_i = int(end_s) if end_s else len(data) - 1
+                        end_i = min(end_i, len(data) - 1)
+                        slice_bytes = data[start_i:end_i + 1]
+                        self.send_response(206)
+                        self.send_header("Content-Range", f"bytes {start_i}-{end_i}/{len(data)}")
+                        self.send_header("Content-Length", str(len(slice_bytes)))
+                        self.send_header("Accept-Ranges", "bytes")
+                        self.end_headers()
+                        self.wfile.write(slice_bytes)
+                    else:
+                        self.send_response(200)
+                        self.send_header("Content-Length", str(len(data)))
+                        self.send_header("Accept-Ranges", "bytes")
+                        self.end_headers()
+                        self.wfile.write(data)
+
+            class _Srv(socketserver.ThreadingMixIn, http.server.HTTPServer):
+                daemon_threads = True
+
+            srv = _Srv(("127.0.0.1", 0), _RangeServerHandler)
+            port = srv.server_address[1]
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            try:
+                import socket
+                try:
+                    with socket.create_connection(("127.0.0.1", port), timeout=2):
+                        pass
+                except PermissionError:
+                    self.skipTest("Loopback TCP sockets blocked by sandbox")
+
+                out_clip = tmp_path / "relayed_clip.mp4"
+                prog_events = []
+
+                def _open_fn(t_url, hdrs):
+                    req = urllib.request.Request(t_url, headers=hdrs)
+                    return urllib.request.urlopen(req, timeout=10)
+
+                run_http_range_relay_trim(
+                    ffmpeg_exe=ffmpeg_exe,
+                    output_path=out_clip,
+                    start_time=1.5,
+                    end_time=4.0,
+                    open_url_fn=_open_fn,
+                    stream_specs={"/m": (f"http://127.0.0.1:{port}/video.mp4", {})},
+                    crop_config=CropConfig(mode="1:1", pan_x=0.5),
+                    progress_callback=lambda p, m: prog_events.append((p, m)),
+                )
+                self.assertTrue(out_clip.exists())
+                self.assertGreater(out_clip.stat().st_size, 1000)
+                self.assertEqual(get_video_dimensions(out_clip), (360, 360))
+                self.assertGreaterEqual(len(prog_events), 1)
+            finally:
+                srv.shutdown()
+                srv.server_close()
 
 
 if __name__ == "__main__":
