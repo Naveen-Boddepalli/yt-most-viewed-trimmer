@@ -1,19 +1,58 @@
+# Python / Testing / Caches
 __pycache__/
 *.py[cod]
 *$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
 .pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments & local binaries
 .venv/
 venv/
 env/
 .bin/
-downloads/
-trimmed_clips/
-temp_workspace/
-*cookies.txt
+
+# Secrets, environment & cookies
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+*cookies*.txt
+*cookies*.json
 user_cookies.txt
 cookies.txt
+cookies/
+
+# Workspaces, caches & media / yt-dlp artifacts
+downloads/
+trimmed_clips/
+raw_clips_cache/
+temp_workspace/
+yt_trimmer_*/
+yt_dlp_cache/
 *.mp4
 *.webm
 *.mkv
+*.ts
+*.m4a
+*.m3u8
+*.part
+*.part-*
+*.ytdl
 *.zip
+*.log
+
+# OS & Editor files
 .DS_Store
+._*
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
