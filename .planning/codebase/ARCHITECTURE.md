@@ -1,176 +1,202 @@
 ---
-last_mapped_commit: 953c1cc506faa8731517922dfb9aaa818ca2b187
-last_mapped_at: 2026-11-11
+last_mapped_commit: 93439675fb29331f3aabaa6cefada3bd2967cb13
+last_mapped_at: 2026-11-12
 ---
-<!-- refreshed: 2026-11-11 -->
+<!-- refreshed: 2026-11-12 -->
 # Architecture
 
-**Analysis Date:** 2026-11-11
+**Analysis Date:** 2026-11-12
 
 ## System Overview
 
 ```text
-+-------------------------------------------------------------------+
-|                   Streamlit UI & Orchestration                    |
-|         `streamlit_app.py` (Cloud wrapper) -> `app.py`            |
-+-----------------------+--------------------------+----------------+
-                        |                          |
-                        v                          v
-+-------------------------------+  +--------------------------------+
-|  YouTube Metadata & Segments  |  | Video Download, Trim & Cropper |
-|       `yt_processor.py`       |  |       `video_trimmer.py`       |
-+---------------+---------------+  +---------------+----------------+
-                |                                  |
-                +----------------+-----------------+
-                                 |
-                                 v
-+-------------------------------------------------------------------+
-|                        Shared Utilities                           |
-|   `utils.py` (cookies, env sanitization, timestamps, JS runtimes) |
-+-------------------------------------------------------------------+
-                                 |
-                                 v
-+-------------------------------------------------------------------+
-|           External Services & Local System Tools                  |
-|  YouTube / googlevideo (`yt-dlp`, `pytubefix`), `ffmpeg`, `node`  |
-+-------------------------------------------------------------------+
+┌─────────────────────────────────────────────────────────────────────────┐
+│                Streamlit Web UI & Orchestration (`app.py`)              │
+│  ┌─────────────────────┐  ┌──────────────────────┐  ┌────────────────┐  │
+│  │  Sidebar Controls   │  │ Plotly Heatmap &     │  │ Clip Cards,    │  │
+│  │  & Crop Preview     │  │ Segment Table        │  │ Preview & ZIP  │  │
+│  └──────────┬──────────┘  └──────────┬───────────┘  └───────┬────────┘  │
+└─────────────┼────────────────────────┼──────────────────────┼───────────┘
+              │                        │                      │
+              ▼                        ▼                      ▼
+┌──────────────────────────────────┐   ┌──────────────────────────────────┐
+│  Metadata & Peak Extraction      │   │  Stream Acquisition & FFmpeg     │
+│  (`yt_processor.py`)             │   │  Trimming/Cropping               │
+│  - Multi-client yt-dlp probe     │   │  (`video_trimmer.py`)            │
+│  - pytubefix metadata fallback   │   │  - Tier 1: Python HLS slicer     │
+│  - Heatmap peak / chapter parser │   │  - Tier 2: 127.0.0.1 Range relay │
+│  - Video & clip size estimators  │   │  - Tier 3: yt-dlp range download │
+└──────────────┬───────────────────┘   │  - Tier 4: pytubefix + FFmpeg    │
+               │                       │  - Local FFmpeg/MoviePy + ZIP    │
+               │                       └──────────────┬───────────────────┘
+               │                                      │
+               ▼                                      ▼
+┌─────────────────────────────────────────────────────────────────────────┐
+│             Environment, Cookie & Formatting Utilities (`utils.py`)     │
+│  - Env sanitization (`MAX_ARG_STRLEN` guard) & `get_clean_env()`        │
+│  - Multi-format cookie parser & isolated temp cookie jar (`/tmp`)       │
+│  - JS runtime discovery (`node` / `deno`) & `YdlCaptureLogger`          │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## Component Responsibilities
 
 | Component | Responsibility | File |
 |-----------|----------------|------|
-| Cloud Entrypoint | Ensures `sys.path`/`cwd`, sanitizes environment, executes `app.py` | `streamlit_app.py` |
-| Web UI & Orchestrator | Sidebar settings, heatmap Plotly chart, crop preview, clip cards, batch/single trim orchestration, downloads | `app.py` |
-| Metadata & Peak Extractor | Multi-client YouTube metadata fetch, heatmap peak extraction, chapter/description/uniform fallbacks, size estimators | `yt_processor.py` |
-| Stream Trimmer & Cropper | 4-tier cloud-resilient stream trimming, HLS slicer, HTTP Range relay, FFmpeg/MoviePy cutting & cropping, ZIP bundling | `video_trimmer.py` |
-| Shared Utilities | Timestamp & byte formatting, YouTube URL validation, multi-format cookie sanitization/isolation, env pruning, JS runtime lookup | `utils.py` |
+| Cloud Entrypoint Wrapper | Normalizes `sys.path`/`cwd`, sanitizes environment, and executes `app.py` via `runpy` for Streamlit Community Cloud | `streamlit_app.py` |
+| Web UI & Session Orchestrator | Renders Streamlit sidebar/main layout, Plotly heatmap chart, CSS crop preview, manages `st.session_state`, coordinates trim/crop/ZIP workflows | `app.py` |
+| Metadata & Engagement Extractor | Probes YouTube metadata across client profiles (`yt-dlp` + `pytubefix` fallback), extracts heatmap peaks or chapter/description/uniform fallbacks, estimates file sizes | `yt_processor.py` |
+| Stream Slicer, Trimmer & Cropper | Discovers/shims FFmpeg, implements 4-tier cloud-resilient stream trimming, runs ephemeral localhost HTTP Range relay, builds FFmpeg `-vf` crop filters, bundles `.zip` archives | `video_trimmer.py` |
+| Environment, Cookies & Helpers | Strips oversized env vars, parses 5 cookie formats into Netscape working copies, locates Node/Deno JS runtimes, formats timestamps/bytes/filenames | `utils.py` |
+| Automated Test Suite | Unit and local FFmpeg integration tests for peak extraction, crop math/filters, cookie parsing, HLS slicing, and HTTP Range relay | `tests/test_processor.py` |
 
 ## Pattern Overview
 
-**Overall:** Modular Monolith (single-process Streamlit application with clear separation between UI orchestration, metadata analysis, media processing, and utilities)
+**Overall:** Layered Monolith with Multi-Tier Fallback Pipelines (Streamlit Reactive Script Architecture)
 
 **Key Characteristics:**
-- Stateless server script rerun model backed by per-session `st.session_state` and a per-session temporary directory (`workspace_dir`)
-- Multi-tier resilience cascade for YouTube access (isolated single-client profiles separating cookieless clients `visionos`/`android` from cookie-authenticated clients `web`/`web_embedded`/`tv_samsung`, plus `pytubefix` fallback)
-- Zero-network FFmpeg execution model in Tiers 1 & 2 (`slice_hls_playlist_to_file` and `run_http_range_relay_trim`), keeping external HTTP requests inside Python (`ydl.urlopen`) so `ffmpeg` never encounters remote HTTP 403 / exit code 8 failures
+- **Reactive top-to-bottom script execution:** `app.py` executes on every Streamlit UI interaction, holding all durable state (metadata, extracted `HighlightSegment` list, workspace path, cached raw/trimmed clips) in `st.session_state`.
+- **Cloud/datacenter resilience via layered fallbacks:** Both metadata extraction (`yt_processor.py`) and media acquisition (`video_trimmer.py`) cycle through ordered cookieless and cookie-authenticated YouTube client profiles (`visionos`, `web_embedded`, `tv_samsung`, `web`, `mweb`, `android`, `ios`) before falling back to `pytubefix`.
+- **Python-owned networking to prevent FFmpeg exit code 8:** For direct stream trimming, FFmpeg never connects to external HTTPS URLs; Python either slices HLS `.m3u8` segments directly (`slice_hls_playlist_to_file`) or proxies byte ranges over an ephemeral `127.0.0.1` HTTP server (`run_http_range_relay_trim`) using IPv4 sockets and `ydl.urlopen`.
+- **Two-stage raw + cropped clip caching:** Single-clip direct trimming saves an uncropped clip under `raw_clips_cache/` (`st.session_state["raw_clips"]`) so subsequent crop preset changes re-encode locally in under a second without re-downloading.
 
 ## Layers
 
 **Presentation & Orchestration Layer:**
-- Purpose: Renders interactive controls, engagement charts, crop overlay previews, and executes user-triggered trim/crop workflows
+- Purpose: Renders interactive controls, engagement visualizations, crop overlays, clip cards, video players, and download buttons; dispatches extraction and trimming actions.
 - Location: `app.py`, `streamlit_app.py`
-- Contains: Streamlit page setup, CSS styles, `init_session_state()`, `build_heatmap_figure()`, `render_crop_framing_preview()`, sidebar & main UI forms, `trim_single_segment_smart()`, `ensure_source_video()`
-- Depends on: `yt_processor.py`, `video_trimmer.py`, `utils.py`, `streamlit`, `plotly`, `pandas`
-- Used by: End users via browser
+- Contains: Streamlit page setup, custom CSS badges, Plotly figure builder (`build_heatmap_figure`), CSS framing preview (`render_crop_framing_preview`), sidebar/main UI, `init_session_state()`, `ensure_source_video()`, `trim_single_segment_smart()`.
+- Depends on: `yt_processor.py`, `video_trimmer.py`, `utils.py`, `streamlit`, `plotly`, `pandas`.
+- Used by: End users via browser (`streamlit run app.py` or `streamlit_app.py`).
 
-**Extraction & Analysis Layer:**
-- Purpose: Queries YouTube metadata and computes ranked highlight time windows and file size estimates
+**Domain Extraction & Estimation Layer:**
+- Purpose: Retrieves YouTube video telemetry and identifies highlight intervals and estimated media sizes.
 - Location: `yt_processor.py`
-- Contains: `HighlightSegment` dataclass, `fetch_video_metadata()`, `extract_most_viewed_segments()`, `extract_fallback_segments()`, `estimate_video_size()`, `estimate_clip_size()`
-- Depends on: `utils.py`, `yt_dlp`, `pytubefix`
-- Used by: `app.py`, `video_trimmer.py` (imports `HighlightSegment`)
+- Contains: `HighlightSegment` dataclass, `fetch_video_metadata()`, `extract_most_viewed_segments()`, `extract_fallback_segments()`, `estimate_video_size()`, `estimate_clip_size()`.
+- Depends on: `utils.py`, `yt-dlp`, `pytubefix` (fallback).
+- Used by: `app.py`, `video_trimmer.py` (imports `HighlightSegment`), `tests/test_processor.py`.
 
-**Media Streaming & Processing Layer:**
-- Purpose: Downloads full videos or byte/segment slices, executes FFmpeg/MoviePy trimming and aspect-ratio cropping, and bundles `.zip` archives
+**Media Acquisition & Processing Layer:**
+- Purpose: Acquires full or byte-range-sliced streams from YouTube and produces trimmed, cropped, H.264/AAC `.mp4` clips and `.zip` bundles.
 - Location: `video_trimmer.py`
-- Contains: `CropConfig`, `CROP_PRESETS`, `build_crop_vf_filter()`, `compute_crop_box_normalized()`, `ensure_ffmpeg()`, `slice_hls_playlist_to_file()`, `run_http_range_relay_trim()`, `download_single_clip_section()`, `download_full_video()`, `trim_clip_ffmpeg()`, `trim_selected_segments()`, `create_clips_zip()`
-- Depends on: `yt_processor.py`, `utils.py`, `yt_dlp`, `pytubefix`, `ffmpeg` CLI, `imageio_ffmpeg`/`static_ffmpeg`, `moviepy`
-- Used by: `app.py`
+- Contains: `CropConfig` dataclass, `CROP_PRESETS`, `build_crop_vf_filter()`, `compute_crop_box_normalized()`, FFmpeg discovery/shimming (`get_ffmpeg_path()`, `ensure_ffmpeg()`), IPv4 urllib opener (`_IPV4_OPENER`), HLS slicer (`slice_hls_playlist_to_file()`), localhost HTTP Range relay (`run_http_range_relay_trim()`), 4-tier `download_single_clip_section()`, `download_full_video()`, `trim_clip_ffmpeg()`, `trim_selected_segments()`, `create_clips_zip()`.
+- Depends on: `yt_processor.HighlightSegment`, `utils.py`, `yt-dlp`, `pytubefix`, `ffmpeg` CLI (`subprocess`), `moviepy` (fallback).
+- Used by: `app.py`, `tests/test_processor.py`.
 
-**Utility Layer:**
-- Purpose: Cross-cutting environment safety, cookie normalization, runtime discovery, and formatting helpers
+**Infrastructure & Utility Layer:**
+- Purpose: Cross-cutting environment safety, cookie jar isolation, JS solver discovery, and string/time/size parsing.
 - Location: `utils.py`
-- Contains: `sanitize_environment()`, `get_clean_env()`, `get_js_runtimes()`, `get_ytdlp_cache_dir()`, `YdlCaptureLogger`, `sanitize_cookie_content()`, `save_yt_cookies()`, `clear_yt_cookies()`, `get_yt_cookies_file()`, `get_cookie_stats()`, `format_timestamp()`, `parse_timestamp()`, `format_bytes()`, `is_valid_youtube_url()`, `sanitize_filename()`, `strip_ansi()`
-- Depends on: Python stdlib (`http.cookiejar`, `tempfile`, `pathlib`, `json`, `re`, `shutil`), optional `streamlit` and `deno`
-- Used by: `app.py`, `streamlit_app.py`, `yt_processor.py`, `video_trimmer.py`
+- Contains: `sanitize_environment()`, `get_clean_env()`, `get_js_runtimes()`, `get_ytdlp_cache_dir()`, `YdlCaptureLogger`, `sanitize_cookie_content()`, `get_yt_cookies_file()`, `save_yt_cookies()`, `clear_yt_cookies()`, `get_cookie_stats()`, `format_bytes()`, `format_timestamp()`, `parse_timestamp()`, `is_valid_youtube_url()`, `sanitize_filename()`, `strip_ansi()`.
+- Depends on: Python standard library (`os`, `re`, `json`, `tempfile`, `http.cookiejar`, `shutil`, `pathlib`), optional `streamlit` (for `st.secrets` / `st.session_state`), optional `deno`.
+- Used by: `app.py`, `streamlit_app.py`, `yt_processor.py`, `video_trimmer.py`, `tests/test_processor.py`.
 
 ## Data Flow
 
-### Primary Request Path (Analyze & Extract Timestamps)
+### Primary Request Path (Extract & Direct Stream-Trim)
 
-1. User submits a YouTube URL and clicks `🔍 Load & Extract Timestamps` (`app.py:540-549`, `app.py:621-624`)
-2. `fetch_video_metadata()` probes YouTube across prioritized client profiles (`web`/`mweb` with cookies if present, then cookieless `visionos`, `web`/`mweb`, `web_embedded`/`tv_samsung`, `android`/`tv_simply`), falling back to `pytubefix` (`yt_processor.py:49-168`)
-3. If `info["heatmap"]` exists, `extract_most_viewed_segments()` finds local maxima, expands contiguous high-replay windows, clamps to `[min_clip_duration, max_clip_duration]`, merges adjacent intervals, and returns top $K$ `HighlightSegment` items (`yt_processor.py:273-399`)
-4. If no heatmap is present, `extract_fallback_segments()` extracts segments from chapters, description timestamps, or uniform spacing (`yt_processor.py:402-481`)
-5. UI stores `video_info` and `segments` in `st.session_state`, renders Plotly heatmap (`build_heatmap_figure()`), metrics, and `pd.DataFrame` table (`app.py:628-756`)
+1. User submits a YouTube URL in `app.py` (`analyze_clicked`, `app.py:621`), validated via `is_valid_youtube_url()` (`utils.py:436`).
+2. `fetch_video_metadata()` (`yt_processor.py:49`) loads isolated cookies via `get_yt_cookies_file()` (`utils.py:303`) and JS runtimes via `get_js_runtimes()` (`utils.py:44`), then queries `yt-dlp` across ordered client profiles (`web`/`mweb` with cookies, `visionos`, `web`/`mweb`, `web_embedded`/`tv_samsung`, `android`/`tv_simply`), falling back to `pytubefix` (`yt_processor.py:132`).
+3. If `info["heatmap"]` is present, `extract_most_viewed_segments()` (`yt_processor.py:273`) detects local maxima, expands contiguous intensity windows, clamps to `[min_clip_dur, max_clip_dur]`, merges adjacent windows, and ranks top `K` `HighlightSegment` objects. Otherwise, `extract_fallback_segments()` (`yt_processor.py:402`) falls back through chapters, description timestamps, or uniform windows.
+4. `app.py` plots the heatmap and shaded segments (`build_heatmap_figure`, `app.py:186`), displays pre-download size estimates (`estimate_video_size`, `estimate_clip_size`), and awaits trim actions.
+5. On single-clip or batch direct stream-trim, `download_single_clip_section()` (`video_trimmer.py:1616`) executes 4 tiers in order:
+   - Tier 1 (`_try_python_hls_direct_slice`, `video_trimmer.py:874`): Downloads only overlapping `.m3u8` media segments in Python (`slice_hls_playlist_to_file`) and trims/crops locally with FFmpeg.
+   - Tier 2 (`_try_python_http_range_slice`, `video_trimmer.py:1273`): Probes 1 KB via `ydl.urlopen`, starts an ephemeral `127.0.0.1` HTTP Range server (`run_http_range_relay_trim`, `video_trimmer.py:1115`), and points local FFmpeg `-ss ... -i http://127.0.0.1:<port>/...` at the relay.
+   - Tier 3 (`video_trimmer.py:1684`): Uses `yt-dlp` with `download_ranges`.
+   - Tier 4 (`video_trimmer.py:1775`): Downloads full video via `_download_with_pytubefix()` into a temp directory and trims locally.
+6. Output `.mp4` paths are stored in `st.session_state["trimmed_clips"]` (and uncropped clips in `st.session_state["raw_clips"]` for single-clip flows), bundled into a `.zip` via `create_clips_zip()` (`video_trimmer.py:1995`), and served through `st.video` and `st.download_button`.
 
-### Video Trimming & Cropping Flow (4-Tier Direct Stream-Trim vs Full Video)
+### Secondary Flow: Full Video Download, Demo Mode & Re-Cropping
 
-1. User triggers `Trim Only Segment #K`, inline `Trim & Prepare Clip #K`, `Re-Trim / Apply Crop`, or `Trim All` (`app.py:785-815`, `app.py:900-1056`, `app.py:1131-1155`)
-2. For single clips in Direct Stream-Trim mode (`app.py:900-987`):
-   - If `raw_clips[rank]` is cached on disk and no full source exists, `trim_clip_ffmpeg()` re-crops locally in <1s without network calls
-   - Otherwise `download_single_clip_section()` (`video_trimmer.py:1616-1800`) fetches an uncropped raw clip through 4 tiers:
-     1. **Tier 1 (`_try_python_hls_direct_slice`)**: Downloads overlapping HLS `.m3u8` segments in Python via `ydl.urlopen`, then runs local FFmpeg trim/mux (`video_trimmer.py:874-1027`)
-     2. **Tier 2 (`_try_python_http_range_slice`)**: Starts an ephemeral `127.0.0.1` HTTP Range relay (`run_http_range_relay_trim()`) backed by `ydl.urlopen` and points local FFmpeg at localhost (`video_trimmer.py:1115-1365`)
-     3. **Tier 3 (`yt-dlp` section download)**: Calls `yt_dlp.YoutubeDL.download()` with `download_ranges` across filtered profiles (`video_trimmer.py:1691-1774`)
-     4. **Tier 4 (`_download_with_pytubefix`)**: Downloads via `pytubefix` and trims locally (`video_trimmer.py:1776-1796`)
-   - Stores raw clip in `st.session_state["raw_clips"]`, optionally applies `CropConfig` via `trim_clip_ffmpeg()`, updates `trimmed_clips`, and regenerates `.zip` via `create_clips_zip()`
-3. If Direct Stream-Trim fails (or `Download Full Video First` / Demo mode is active), `ensure_source_video()` downloads the full video (`download_full_video()` or generates a synthetic `demo_source.mp4` with FFmpeg `testsrc`), and `trim_selected_segments()` slices & crops locally (`app.py:852-888`, `app.py:970-1023`)
+1. If "Download Full Video First" is selected, direct stream-trim fails, or Demo Mode is active (`demo_clicked`, `app.py:580`), `ensure_source_video()` (`app.py:852`) either generates a synthetic 300s `demo_source.mp4` via FFmpeg `lavfi` or calls `download_full_video()` (`video_trimmer.py:1536`).
+2. `trim_selected_segments()` (`video_trimmer.py:1948`) calls `trim_clip_ffmpeg()` (`video_trimmer.py:1854`) for each segment, applying `build_crop_vf_filter(crop_config)` (`video_trimmer.py:96`) with `libx264` encoding when cropping is active (or `-c copy` when `fast_copy=True` and uncropped), falling back to `moviepy` (`video_trimmer.py:1908`) if the FFmpeg CLI fails.
+3. On "Re-Trim / Apply Crop" (`app.py:1131`), `trim_single_segment_smart()` (`app.py:900`) re-uses `st.session_state["raw_clips"][rank]` or `st.session_state["source_video_path"]` to re-crop locally with zero network calls.
 
 **State Management:**
-- `st.session_state` (`app.py:151-178`) holds `video_info`, `video_url`, `segments`, `source_video_path`, `trimmed_clips`, `raw_clips`, `all_clips_zip_path`, `workspace_dir`, `youtube_cookies_text`, and `_pending_cookie_box_val` (used to avoid Streamlit widget-key mutation errors when syncing the sidebar cookie textarea)
+- Ephemeral per-session workspace created via `tempfile.mkdtemp(prefix="yt_trimmer_")` stored in `st.session_state["workspace_dir"]` (`app.py:160`), containing `downloads/`, `trimmed_clips/`, `raw_clips_cache/`, and `*_most_viewed_clips.zip`.
+- Cookie persistence uses `user_cookies.txt` (CWD or tempdir), `/tmp/env_cookies.txt`, `st.secrets["YOUTUBE_COOKIES"]`, or `st.session_state["youtube_cookies_text"]`, copied per process to `/tmp/yt_working_cookies_<pid>.txt` (`utils.py:266`) so `yt-dlp` cookie mutations do not corrupt master cookies.
 
 ## Key Abstractions
 
-**`HighlightSegment` (`yt_processor.py:23-46`):**
-- Purpose: Uniform representation of a candidate highlight clip regardless of extraction source (`heatmap`, `chapters`, `description_timestamps`, `uniform_fallback`, `custom`)
-- Pattern: `@dataclass` with computed `@property` helpers (`duration`, `time_range_str`) and `to_dict()`
+**`HighlightSegment`:**
+- Purpose: Canonical representation of an extracted highlight interval (`rank`, `start_time`, `end_time`, `peak_time`, `score`, `source`, `label`) with computed `duration` and `time_range_str` properties.
+- Examples: `yt_processor.py:23-46`, consumed across `app.py` and `video_trimmer.py`.
+- Pattern: `@dataclass` value object with `to_dict()` serialization.
 
-**`CropConfig` (`video_trimmer.py:61-93`):**
-- Purpose: Encapsulates aspect-ratio preset (`none`, `9:16`, `9:16_blur`, `1:1`, `4:5`, `4:3`, `custom`), subject focus panning (`pan_x`, `pan_y`), and edge crop percentages
-- Pattern: `@dataclass` paired with pure filter-generation (`build_crop_vf_filter()`) and normalized preview geometry (`compute_crop_box_normalized()`)
+**`CropConfig` + Filter Builder:**
+- Purpose: Encapsulates aspect-ratio preset (`none`, `9:16`, `9:16_blur`, `1:1`, `4:5`, `4:3`, `custom`), horizontal/vertical pan (`pan_x`, `pan_y`), and edge crop percentages, translating them identically into FFmpeg `-vf` expressions (`build_crop_vf_filter`), normalized preview boxes (`compute_crop_box_normalized`), and deterministic filename tags (`file_tag`).
+- Examples: `video_trimmer.py:50-191`.
+- Pattern: `@dataclass` configuration object + pure projection functions used by both UI preview (`app.py:243`) and FFmpeg/MoviePy execution (`video_trimmer.py:1870`, `1923`).
 
-**`YdlCaptureLogger` (`utils.py:22-41`):**
-- Purpose: Suppresses noisy `yt-dlp` console output while capturing warnings and errors
+**4-Tier Stream Acquisition & Localhost HTTP Relay:**
+- Purpose: Decouples external YouTube networking (IPv4 enforcement, cookies, client rotation, retries) from FFmpeg execution so cloud datacenter IPs do not trigger HTTP 403 / FFmpeg exit code 8.
+- Examples: `slice_hls_playlist_to_file()` (`video_trimmer.py:680`), `run_http_range_relay_trim()` (`video_trimmer.py:1115`), `download_single_clip_section()` (`video_trimmer.py:1616`).
+- Pattern: Strategy chain (HLS Python slicer → Localhost Range proxy → `yt-dlp` sections → `pytubefix` fallback).
+
+**`YdlCaptureLogger`:**
+- Purpose: Silences `yt-dlp` stdout/stderr noise while capturing warnings and errors in memory.
+- Examples: `utils.py:22-41`, instantiated in `yt_processor.py:97` and `video_trimmer.py:581`, `1480`.
+- Pattern: Adapter implementing the `yt-dlp` logger interface (`debug`, `info`, `warning`, `error`).
 
 ## Entry Points
 
-**Local & Container Entrypoint (`app.py`):**
-- Location: `app.py`
-- Triggers: `streamlit run app.py` (local CLI and `Dockerfile` `CMD`)
-- Responsibilities: Fixes `sys.path`/`cwd`, sanitizes environment, initializes session state, and renders full Streamlit UI
+**Primary Streamlit App (`app.py`):**
+- Location: `app.py` (invoked via `streamlit run app.py` in `Dockerfile:28` and `README.md:114`).
+- Triggers: HTTP requests to Streamlit server (port `7860` in Docker, `8501` default locally).
+- Responsibilities: Initializes `sys.path`/`cwd`, sanitizes environment, initializes `st.session_state`, renders UI, and orchestrates extraction, trimming, cropping, and downloads.
 
-**Streamlit Cloud Wrapper (`streamlit_app.py`):**
+**Streamlit Community Cloud Wrapper (`streamlit_app.py`):**
 - Location: `streamlit_app.py`
-- Triggers: Streamlit Community Cloud default main file lookup (`streamlit_app.py`)
-- Responsibilities: Sets `ROOT_DIR` on `sys.path`, calls `sanitize_environment()`, and executes `app.py` via `runpy.run_path(..., run_name="__main__")`
+- Triggers: Default entrypoint searched by Streamlit Community Cloud.
+- Responsibilities: Inserts repo root into `sys.path`, sets `cwd`, runs `sanitize_environment()`, and executes `app.py` via `runpy.run_path(..., run_name="__main__")`.
+
+**Test Suite (`tests/test_processor.py`):**
+- Location: `tests/test_processor.py`
+- Triggers: `pytest -v` or `python -m unittest`.
+- Responsibilities: Validates timestamp/byte/cookie/env utilities, heatmap peak and fallback extraction, FFmpeg crop filter math, local HLS slicing, and localhost HTTP Range relay behavior.
 
 ## Architectural Constraints
 
-- **Threading:** Streamlit executes top-to-bottom per user interaction on a script runner thread. `run_http_range_relay_trim()` (`video_trimmer.py:1206-1270`) spawns a daemon `ThreadingMixIn` HTTP server on `127.0.0.1:0` and serializes `ydl.urlopen()` setup with `threading.Lock()`, while FFmpeg runs in a child subprocess.
-- **Global state & import side effects:** `utils.py:133` calls `sanitize_environment()` at import time; `video_trimmer.py:42-44,392` mutates `os.environ` (`YTDLP_JS_RUNTIMES`, `PATH`) and discovers/copies the FFmpeg shim at import time; `app.py:14-17` and `streamlit_app.py:9-12` call `os.chdir(PROJECT_ROOT)` at import time.
-- **IPv4 enforcement:** `_create_ipv4_connection()` and `_IPV4_OPENER` (`video_trimmer.py:491-543`) force `socket.AF_INET` alongside `source_address: "0.0.0.0"` in `yt-dlp` options so `googlevideo.com` signed IP-bound URLs match across Python and subprocesses.
-- **Even dimensions for H.264:** `build_crop_vf_filter()` (`video_trimmer.py:96-148`) wraps width/height expressions in `trunc(.../2)*2` because `libx264` with `yuv420p` rejects odd dimensions.
+- **Threading:** Streamlit executes user sessions across worker threads; `run_http_range_relay_trim()` (`video_trimmer.py:1206`) spawns a `ThreadingMixIn` HTTP server on `127.0.0.1:0` with daemon threads and serializes `ydl.urlopen` calls through a per-call `threading.Lock()` (`video_trimmer.py:1347`) to avoid concurrent `cookiejar` mutation races.
+- **Global state:** `utils.py:133` mutates `os.environ` at import time (`sanitize_environment()`). `video_trimmer.py:42-44, 392` mutates `os.environ["YTDLP_JS_RUNTIMES"]`, `os.environ["PATH"]`, and writes a binary shim into `<tempdir>/ffmpeg_bin/ffmpeg` at import time. `_IPV4_OPENER` (`video_trimmer.py:542`) is a module-level singleton opener.
+- **Circular imports:** No circular imports exist; the dependency DAG flows strictly downward: `app.py` → `{yt_processor.py, video_trimmer.py, utils.py}`, `video_trimmer.py` → `{yt_processor.py, utils.py}`, `yt_processor.py` → `utils.py`.
+- **Linux `MAX_ARG_STRLEN` (`E2BIG`):** All `subprocess.run` / `subprocess.Popen` calls to `ffmpeg` pass `env=get_clean_env()` (`utils.py:116`) to prevent `Errno 7` when large cookie or secret variables exist in the container environment.
+- **IPv4 pinning:** YouTube signed `googlevideo.com` URLs are IP-bound to the extraction IP; both `yt-dlp` (`"source_address": "0.0.0.0"`) and `_create_ipv4_connection` (`socket.AF_INET`, `video_trimmer.py:491`) enforce IPv4 so IPv6/IPv4 dual-stack mismatches do not cause HTTP 403.
 
 ## Anti-Patterns
 
-### Import-Time Side Effects & Reload Workaround
+### Import-Time Side Effects & Process Mutation
 
-**What happens:** `utils.py:133` and `video_trimmer.py:392` mutate global environment state on import, and `app.py:71-90` catches `ImportError` to run `importlib.reload(sys.modules["video_trimmer"])`.
-**Why it's wrong:** Import order alters `os.environ` globally and makes module initialization harder to test or isolate.
-**Do this instead:** Initialize FFmpeg shims and environment sanitization explicitly inside application startup (`init_session_state()` or dedicated `bootstrap()` helper) rather than at module top level.
+**What happens:** Importing `utils.py` immediately calls `sanitize_environment()` (`utils.py:133`), and importing `video_trimmer.py` immediately sets `os.environ["YTDLP_JS_RUNTIMES"]` (`video_trimmer.py:44`) and runs `ensure_ffmpeg()` (`video_trimmer.py:392`), which probes binaries, spawns subprocesses, copies binaries to `<tempdir>/ffmpeg_bin`, and mutates `os.environ["PATH"]`.
+**Why it's wrong:** Slows down imports, performs filesystem/subprocess I/O during module loading or test collection, and mutates process-wide `os.environ` as a hidden side effect.
+**Do this instead:** Move `sanitize_environment()` and `ensure_ffmpeg()` initialization strictly into explicit startup hooks (`app.py`, `streamlit_app.py`) or lazy cached getters (`@functools.lru_cache`).
 
-### Deeply Nested Orchestration Closures in UI Script
+### Monolithic UI Script Mixing Orchestration and Subprocess Logic
 
-**What happens:** `ensure_source_video()`, `show_trim_error()`, and `trim_single_segment_smart()` are defined as nested closures inside the `if segments:` block of `app.py:852-987`, duplicating fallback/ZIP logic with the `trim_all_clicked` branch (`app.py:989-1046`).
-**Why it's wrong:** Couples business workflow logic directly to Streamlit widget state and makes the orchestration untestable outside Streamlit.
-**Do this instead:** Extract trimming/caching orchestration into a standalone service function or module accepting explicit paths and callbacks, keeping `app.py` strictly for UI state binding.
+**What happens:** `app.py` (`app.py:852-987`) defines nested orchestration functions (`ensure_source_video()`, `trim_single_segment_smart()`) inside the main script body and directly invokes `subprocess.run` for FFmpeg demo video synthesis (`app.py:863-875`) alongside Streamlit widget calls.
+**Why it's wrong:** Couples business workflows (caching raw clips, generating synthetic demo MP4s, fallback switching) to Streamlit execution order, preventing unit testing of the smart caching/trimming logic outside a Streamlit runtime.
+**Do this instead:** Move `generate_demo_video()` and clip-orchestration helpers into `video_trimmer.py` (or a dedicated `workflow.py` module) so `app.py` only binds UI state to service calls.
+
+### Silent Exception Swallowing Across Fallback Loops
+
+**What happens:** `yt_processor.py:127-129, 161-164` and `video_trimmer.py:1024-1025, 1362-1363, 1463-1464` catch `except Exception:` and `continue` without recording per-client failure reasons, and `app.py:71-90` duplicates the entire `video_trimmer` import list inside an `except ImportError` + `importlib.reload` block.
+**Why it's wrong:** Masks whether a failure came from bot detection, missing JS runtime, expired cookies, or a transient network error, making cloud debugging opaque; duplicated import blocks risk drifting out of sync.
+**Do this instead:** Capture `(profile_name, str(exc))` diagnostic entries during fallback loops and attach them to raised errors or UI diagnostics; keep clean single-block imports at module top.
 
 ## Error Handling
 
-**Strategy:** Multi-tier fallback cascades with user-friendly Streamlit error alerts and bot-bypass guidance.
+**Strategy:** Multi-tier silent fallback within acquisition loops, surfacing the last captured exception or a generic `RuntimeError`/`FileNotFoundError` to `app.py`, which strips ANSI escape codes (`strip_ansi`) and displays contextual cookie/bot-bypass guidance (`show_trim_error`, `app.py:890`).
 
 **Patterns:**
-- Client/tier retry loops (`yt_processor.py:96-129`, `video_trimmer.py:905-1025, 1311-1363, 1697-1773`) catch `Exception`, store `last_exc`, and silently try the next client profile or tier.
-- `app.py:890-898` strips ANSI sequences (`strip_ansi()`) from exceptions before displaying `st.error()`, adding contextual cookie/bot-bypass warnings when `403`, `bot`, or `sign in` appears.
+- **Graceful tier fallback:** `app.py:970-981` and `app.py:1011-1023` catch failures in Direct Stream-Trim and automatically fall back to `ensure_source_video()` + `trim_selected_segments()`.
+- **External library warning suppression:** `pytubefix` imports are wrapped in `warnings.catch_warnings()` ignoring `SyntaxWarning` on Python 3.12 (`yt_processor.py:133-135`, `video_trimmer.py:1378-1379`).
+- **Temp artifact cleanup:** Temporary `.ts` and `.part` files are cleaned up in `finally:` blocks (`video_trimmer.py:950-955`, `1017-1023`) or pre-attempt glob loops (`video_trimmer.py:1572-1576`, `1698-1702`).
 
 ## Cross-Cutting Concerns
 
-**Logging:** `YdlCaptureLogger` (`utils.py:22-41`) suppresses `yt-dlp` stdout/stderr noise; no structured `logging` module logger is configured across application modules.
-**Validation:** URL format checked via regex in `is_valid_youtube_url()` (`utils.py:436-443`); custom timestamps validated via `parse_timestamp()` and duration bounds (`app.py:828-849`); filenames sanitized via `sanitize_filename()` (`utils.py:446-450`).
-**Authentication:** Isolated per-PID Netscape cookie jar files created by `get_yt_cookies_file()` (`utils.py:303-359`) to protect persisted cookies from `yt-dlp` mutation.
+**Logging:** `YdlCaptureLogger` (`utils.py:22`) suppresses `yt-dlp` console output while buffering warnings/errors; FFmpeg runs with `stdout=subprocess.DEVNULL`/`PIPE` and `stderr` captured for error messages; runtime diagnostics are exposed in the UI via `get_ffmpeg_diagnostics()` (`video_trimmer.py:361`) and `get_cookie_stats()` (`utils.py:362`).
+**Validation:** YouTube URL regex check (`is_valid_youtube_url`, `utils.py:436`), timestamp parsing bounds (`app.py:833`), cookie line format validation (`sanitize_cookie_content`, `utils.py:144`), and binary execution checks (`is_ffmpeg_executable`, `video_trimmer.py:221`).
+**Authentication:** Optional YouTube session cookie injection supporting Netscape, JSON, Chrome/Edge DevTools, `Cookie:` header, and 2-column/alternating text formats (`utils.py:144-257`), resolved in priority order from disk (`user_cookies.txt`, `cookies.txt`), `/tmp/env_cookies.txt`, `st.secrets`, and `st.session_state`, then copied to an isolated per-PID working file (`utils.py:260-268`).
 
 ---
 
-*Architecture analysis: 2026-11-11*
+*Architecture analysis: 2026-11-12*
