@@ -64,6 +64,7 @@ try:
         trim_clip_ffmpeg,
         trim_selected_segments,
         create_clips_zip,
+        YouTubeBlockedError,
     )
 except ImportError:
     import importlib
@@ -81,6 +82,7 @@ except ImportError:
         trim_clip_ffmpeg,
         trim_selected_segments,
         create_clips_zip,
+        YouTubeBlockedError,
     )
 
 # Streamlit >= 1.40 compatibility: replace deprecated use_container_width=True with width="stretch"
@@ -773,7 +775,26 @@ if info:
         def show_trim_error(prefix: str, exc: Exception):
             clean_msg = strip_ansi(str(exc))
             st.error(f"{prefix}: {clean_msg}")
-            if "403" in clean_msg or "bot" in clean_msg.lower() or "sign in" in clean_msg.lower():
+            if isinstance(exc, YouTubeBlockedError):
+                cookie_source = get_cookie_stats().get("source")
+                if cookie_source:
+                    st.caption(
+                        "YouTube's bot check rejected this server even with the "
+                        f"{'cookies you pasted' if cookie_source == 'session' else 'server cookies'}. "
+                        "They have probably expired or been rotated. Export fresh ones from a private/incognito "
+                        "window (then close it) and paste them under **YouTube cookies** in the sidebar."
+                    )
+                else:
+                    st.caption(
+                        "YouTube blocks most cloud servers that don't present cookies from a signed-in account. "
+                        "Paste your YouTube cookies under **YouTube cookies** in the sidebar, or, if you run this "
+                        "app, add them as the `YOUTUBE_COOKIES` secret in your Streamlit Cloud app settings. "
+                        "Running the app on your own computer also avoids this."
+                    )
+                with st.expander("Why each download attempt failed"):
+                    wrap_kw = {"wrap_lines": True} if "wrap_lines" in inspect.signature(st.code).parameters else {}
+                    st.code("\n".join(dict.fromkeys(exc.reasons)) or "(no details)", language=None, **wrap_kw)
+            elif "403" in clean_msg or "bot" in clean_msg.lower() or "sign in" in clean_msg.lower():
                 st.caption(
                     "YouTube blocked this download. If the video is age-restricted or private, "
                     "paste fresh cookies under **YouTube cookies** in the sidebar."
@@ -855,6 +876,11 @@ if info:
                     else:
                         shutil.copy2(raw_clip_path, clip_path)
                     trimmed_map = {target_seg.rank: clip_path}
+                except YouTubeBlockedError:
+                    # The full download uses the same clients, so it would only spend
+                    # minutes reaching the same block. Report it straight away.
+                    prog_bar.empty()
+                    raise
                 except Exception:
                     prog_bar.empty()
                     st.toast("Clip-only download failed, downloading the full video instead...")
