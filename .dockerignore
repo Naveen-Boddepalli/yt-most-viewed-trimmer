@@ -1,6 +1,7 @@
 .git
 .gitignore
 .pytest_cache
+.planning
 __pycache__
 *.pyc
 *.part
@@ -8,3 +9,13 @@ __pycache__
 *.zip
 downloads
 trimmed_clips
+raw_clips_cache
+temp_workspace
+yt_dlp_cache
+
+# Secrets & cookies: never bake into an image layer
+*cookies*
+cookies/
+.env
+.env.*
+.streamlit/secrets.toml

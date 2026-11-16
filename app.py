@@ -37,6 +37,8 @@ from utils import (
     save_yt_cookies,
     clear_yt_cookies,
     get_cookie_stats,
+    load_persisted_cookies,
+    is_single_user_mode,
     sanitize_environment,
     get_clean_env,
 )
@@ -164,12 +166,9 @@ def init_session_state():
             st.session_state[k] = v
 
     if "youtube_cookies_text" not in st.session_state:
-        saved_text = ""
-        for saved_cf in (Path("user_cookies.txt"), Path(tempfile.gettempdir()) / "user_cookies.txt"):
-            if saved_cf.exists() and saved_cf.stat().st_size > 0:
-                saved_text = saved_cf.read_text(encoding="utf-8")
-                break
-        st.session_state["youtube_cookies_text"] = saved_text
+        # Only this visitor's own cookies ever go in session state. Server cookies
+        # are never pre-filled; disk restore happens only in opt-in single-user mode.
+        st.session_state["youtube_cookies_text"] = load_persisted_cookies()
 
     if "_pending_cookie_box_val" in st.session_state:
         st.session_state["cookie_textarea_box"] = st.session_state.pop("_pending_cookie_box_val")
@@ -456,6 +455,7 @@ with st.sidebar:
     has_active_cookies = cookie_stats.get("active", False)
     yt_count = cookie_stats.get("yt_count", 0)
     has_auth = cookie_stats.get("has_auth", False)
+    cookie_source = cookie_stats.get("source")
     badge = f"({yt_count} Active ✅)" if has_active_cookies else ""
     with st.expander(f"🍪 YouTube Cookies / Bot Bypass {badge}", expanded=not has_active_cookies):
         st.caption(
@@ -481,11 +481,20 @@ with st.sidebar:
                     st.success("✅ Cookies saved!")
                     st.rerun()
         with col_c2:
-            if has_active_cookies and st.button("🗑️ Clear Cookies", key="clear_sidebar_cookie_btn", **STRETCH_WIDTH):
-                clear_yt_cookies()
+            if cookie_source == "session" and st.button("🗑️ Clear Cookies", key="clear_sidebar_cookie_btn", **STRETCH_WIDTH):
+                clear_yt_cookies(st.session_state.get("youtube_cookies_text"))
                 st.session_state["youtube_cookies_text"] = ""
                 st.session_state["_pending_cookie_box_val"] = ""
                 st.rerun()
+
+        if cookie_source == "session":
+            st.caption(
+                "🔒 Saved to disk on this machine (single-user mode)."
+                if is_single_user_mode()
+                else "🔒 Kept only in your browser session. Not shared with other visitors; cleared when you close or refresh the tab."
+            )
+        elif cookie_source == "server":
+            st.caption("🖥️ Using cookies provided by the app operator. Paste your own to override them for your session.")
 
         if has_active_cookies:
             if has_auth:

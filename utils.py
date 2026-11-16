@@ -1,10 +1,12 @@
 """Utility functions for timestamp formatting, validation, size formatting, cookie handling, and file cleanup."""
 
+import hashlib
 import json
 import os
 import re
 import shutil
 import tempfile
+import time
 from pathlib import Path
 from typing import Tuple, Optional, Dict, Any, List
 
@@ -100,9 +102,7 @@ def sanitize_environment() -> None:
         if "cookie" in key.lower() or key.upper() in ("YOUTUBE_COOKIES", "COOKIES"):
             if val_len > 0:
                 try:
-                    cfile = Path(tempfile.gettempdir()) / "env_cookies.txt"
-                    if not cfile.exists() or cfile.stat().st_size == 0:
-                        cfile.write_text(sanitize_cookie_content(val), encoding="utf-8")
+                    _write_private_file(_env_cookie_path(), sanitize_cookie_content(val))
                 except Exception:
                     pass
             os.environ.pop(key, None)
@@ -127,10 +127,6 @@ def get_clean_env() -> Dict[str, str]:
     if "PATH" not in clean:
         clean["PATH"] = os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")
     return clean
-
-
-# Run immediately on module import
-sanitize_environment()
 
 
 def _parse_cookie_expiry(raw_exp: Any) -> int:
@@ -257,113 +253,226 @@ def sanitize_cookie_content(content: str) -> str:
     return "\n".join(lines) + "\n"
 
 
+# ------------------------------------------------------------------------------
+# Cookie storage
+#
+# Two kinds of cookies exist and are kept strictly apart:
+#   * Session cookies: pasted by a visitor in the UI. They live only in that
+#     visitor's `st.session_state`, are never written to a shared location, and
+#     are never shown to anyone else.
+#   * Server cookies: provided by whoever runs the app (st.secrets, a cookie
+#     environment variable, or a cookies.txt / user_cookies.txt file placed next
+#     to the app). Used as a fallback for every visitor, but their content is
+#     never displayed or deletable from the UI.
+#
+# Set YT_TRIMMER_SINGLE_USER=1 when running the app only for yourself to have
+# pasted cookies saved to user_cookies.txt and restored after a page refresh.
+# ------------------------------------------------------------------------------
+SESSION_COOKIE_KEY = "youtube_cookies_text"
+SINGLE_USER_ENV = "YT_TRIMMER_SINGLE_USER"
+APP_ROOT = Path(__file__).resolve().parent
+SERVER_COOKIE_FILENAMES = ("user_cookies.txt", "cookies.txt")
+PERSISTED_COOKIE_FILENAME = "user_cookies.txt"
+_WORKING_JAR_MAX_AGE_SECONDS = 6 * 3600
+
+
+def is_single_user_mode() -> bool:
+    """True when the operator opted in to persisting pasted cookies on disk."""
+    return os.environ.get(SINGLE_USER_ENV, "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _private_cookie_dir() -> Path:
+    """Owner-only (0700) directory in tempdir for working cookie jars."""
+    uid = os.getuid() if hasattr(os, "getuid") else "user"
+    d = Path(tempfile.gettempdir()) / f"yt_trimmer_cookies_{uid}"
+    d.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        os.chmod(d, 0o700)
+    except OSError:
+        pass
+    return d
+
+
+def _env_cookie_path() -> Path:
+    return _private_cookie_dir() / "env_cookies.txt"
+
+
+def _write_private_file(path: Path, content: str) -> None:
+    """Atomically write `content` to `path` with owner-only (0600) permissions."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp_", suffix=".txt")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
+
+
+def _working_jar_path(sanitized_content: str) -> Path:
+    digest = hashlib.sha256(sanitized_content.encode("utf-8")).hexdigest()[:32]
+    return _private_cookie_dir() / f"jar_{digest}.txt"
+
+
+def _prune_stale_working_jars() -> None:
+    try:
+        cutoff = time.time() - _WORKING_JAR_MAX_AGE_SECONDS
+        for jar in _private_cookie_dir().glob("jar_*.txt"):
+            try:
+                if jar.stat().st_mtime < cutoff:
+                    jar.unlink()
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
 def _write_working_cookie_copy(sanitized_content: str) -> str:
     """
-    Write sanitized cookie content to a fresh working file in tempdir.
-    yt-dlp mutates/overwrites its `cookiefile` in-place after every request,
-    which can strip or expire master cookies if given the master file directly.
+    Write sanitized cookie content to a working jar and return its path.
+
+    yt-dlp mutates/overwrites its `cookiefile` in place after every request, so it
+    never gets a master file. Each distinct cookie set gets its own owner-only jar
+    named by content hash, so concurrent sessions in one process never share a jar
+    with different cookies, and the jar is reset from the master on every call.
     """
-    work_cf = Path(tempfile.gettempdir()) / f"yt_working_cookies_{os.getpid()}.txt"
-    work_cf.write_text(sanitized_content, encoding="utf-8")
-    return str(work_cf.resolve())
+    _prune_stale_working_jars()
+    jar = _working_jar_path(sanitized_content)
+    _write_private_file(jar, sanitized_content)
+    return str(jar)
+
+
+def _read_session_cookies() -> Optional[str]:
+    """Return the current visitor's pasted cookies, if any."""
+    try:
+        import streamlit as st
+        pasted = st.session_state.get(SESSION_COOKIE_KEY)
+        if pasted and str(pasted).strip():
+            return str(pasted)
+    except Exception:
+        pass
+    return None
+
+
+def _read_server_cookies() -> Optional[str]:
+    """Return operator-provided cookies (files next to the app, env var, or st.secrets)."""
+    for name in SERVER_COOKIE_FILENAMES:
+        p = APP_ROOT / name
+        try:
+            if p.is_file() and p.stat().st_size > 0:
+                return p.read_text(encoding="utf-8")
+        except Exception:
+            continue
+
+    try:
+        env_cf = _env_cookie_path()
+        if env_cf.is_file() and env_cf.stat().st_size > 0:
+            return env_cf.read_text(encoding="utf-8")
+    except Exception:
+        pass
+
+    try:
+        import streamlit as st
+        for key in ("YOUTUBE_COOKIES", "youtube_cookies", "cookies"):
+            if key in st.secrets:
+                val = st.secrets[key]
+                if val and str(val).strip():
+                    return str(val)
+    except Exception:
+        pass
+    return None
+
+
+def _resolve_cookies() -> Tuple[Optional[str], Optional[str]]:
+    """Return (sanitized cookie content, source) where source is 'session' or 'server'."""
+    for source, reader in (("session", _read_session_cookies), ("server", _read_server_cookies)):
+        raw = reader()
+        if raw:
+            sanitized = sanitize_cookie_content(raw)
+            if any(l.strip() and not l.startswith("#") for l in sanitized.splitlines()):
+                return sanitized, source
+    return None, None
 
 
 def save_yt_cookies(content: str) -> str:
-    """Sanitize and persist user cookies to disk (CWD with tempdir fallback)."""
+    """
+    Sanitize pasted cookies and return them for storing in the visitor's session.
+
+    Nothing is written to disk unless YT_TRIMMER_SINGLE_USER is enabled, in which
+    case the cookies are also saved (0600) to user_cookies.txt to survive refreshes.
+    """
     sanitized = sanitize_cookie_content(content)
-    for target in (Path("user_cookies.txt"), Path(tempfile.gettempdir()) / "user_cookies.txt"):
+    if is_single_user_mode():
         try:
-            target.write_text(sanitized, encoding="utf-8")
-            return sanitized
+            _write_private_file(APP_ROOT / PERSISTED_COOKIE_FILENAME, sanitized)
         except Exception:
-            continue
+            pass
     return sanitized
 
 
-def clear_yt_cookies() -> None:
-    """Remove persisted and working cookie files from disk and tempdir."""
-    for p in (
-        Path("user_cookies.txt"),
-        Path("cookies.txt"),
-        Path(tempfile.gettempdir()) / "user_cookies.txt",
-        Path(tempfile.gettempdir()) / "env_cookies.txt",
-    ):
+def load_persisted_cookies() -> str:
+    """Return cookies saved by single-user mode, or '' (always '' in multi-user mode)."""
+    if not is_single_user_mode():
+        return ""
+    p = APP_ROOT / PERSISTED_COOKIE_FILENAME
+    try:
+        if p.is_file() and p.stat().st_size > 0:
+            return p.read_text(encoding="utf-8")
+    except Exception:
+        pass
+    return ""
+
+
+def clear_yt_cookies(session_content: Optional[str] = None) -> None:
+    """
+    Remove the calling visitor's cookies: their working jar and, in single-user
+    mode, the persisted user_cookies.txt. Server cookies and other visitors'
+    jars are never touched.
+    """
+    if session_content and str(session_content).strip():
         try:
-            if p.exists():
-                p.unlink()
+            _working_jar_path(sanitize_cookie_content(str(session_content))).unlink(missing_ok=True)
         except Exception:
             pass
-    for tmp_f in Path(tempfile.gettempdir()).glob("*cookies*.txt"):
+    if is_single_user_mode():
         try:
-            tmp_f.unlink()
+            (APP_ROOT / PERSISTED_COOKIE_FILENAME).unlink(missing_ok=True)
         except Exception:
             pass
 
 
 def get_yt_cookies_file() -> Optional[str]:
     """
-    Check if YouTube cookies are available from:
-    1. Persistent user_cookies.txt or local cookies.txt (CWD or tempdir)
-    2. /tmp/env_cookies.txt
-    3. Streamlit secrets (st.secrets["YOUTUBE_COOKIES"])
-    4. Streamlit session_state (user pasted in sidebar)
-    Returns the resolved string path to an isolated working cookie file or None.
+    Return the path to an isolated working cookie jar for yt-dlp, or None.
+
+    The visitor's own pasted cookies (session) take priority; otherwise
+    operator-provided server cookies are used.
     """
-    # 1. Check persistent user_cookies.txt or cookies.txt on disk
-    disk_candidates = [
-        Path("user_cookies.txt"),
-        Path("cookies.txt"),
-        Path(tempfile.gettempdir()) / "user_cookies.txt",
-    ]
-    for p in disk_candidates:
-        if p.exists() and p.stat().st_size > 0:
-            try:
-                raw = p.read_text(encoding="utf-8")
-                sanitized = sanitize_cookie_content(raw)
-                return _write_working_cookie_copy(sanitized)
-            except Exception:
-                return str(p.resolve())
-
-    # 2. Check /tmp/env_cookies.txt saved from sanitized environment variables
-    env_cf = Path(tempfile.gettempdir()) / "env_cookies.txt"
-    if env_cf.exists() and env_cf.stat().st_size > 0:
-        try:
-            raw = env_cf.read_text(encoding="utf-8")
-            sanitized = sanitize_cookie_content(raw)
-            return _write_working_cookie_copy(sanitized)
-        except Exception:
-            pass
-
-    # 3. Check Streamlit secrets (permanent cloud storage)
+    sanitized, _source = _resolve_cookies()
+    if not sanitized:
+        return None
     try:
-        import streamlit as st
-        for key in ["YOUTUBE_COOKIES", "youtube_cookies", "cookies"]:
-            if hasattr(st, "secrets") and key in st.secrets:
-                val = st.secrets[key]
-                if val and str(val).strip():
-                    sanitized = sanitize_cookie_content(str(val))
-                    return _write_working_cookie_copy(sanitized)
+        return _write_working_cookie_copy(sanitized)
     except Exception:
-        pass
-
-    # 4. Check Streamlit session_state
-    try:
-        import streamlit as st
-        pasted = st.session_state.get("youtube_cookies_text")
-        if pasted and str(pasted).strip():
-            sanitized = sanitize_cookie_content(str(pasted))
-            return _write_working_cookie_copy(sanitized)
-    except Exception:
-        pass
-
-    return None
+        return None
 
 
 def get_cookie_stats() -> Dict[str, Any]:
     """Return count and validity of active YouTube cookies for UI diagnostics."""
-    cfile = get_yt_cookies_file()
+    content, source = _resolve_cookies()
+    cfile = None
+    if content:
+        try:
+            cfile = _write_working_cookie_copy(content)
+        except Exception:
+            cfile = None
     if not cfile or not Path(cfile).exists() or Path(cfile).stat().st_size == 0:
-        return {"active": False, "count": 0, "names": [], "has_auth": False}
+        return {"active": False, "count": 0, "names": [], "has_auth": False, "source": None}
     import http.cookiejar
     cj = http.cookiejar.MozillaCookieJar(cfile)
     try:
@@ -379,10 +488,10 @@ def get_cookie_stats() -> Dict[str, Any]:
             "yt_count": len(yt_cookies),
             "names": names[:12],
             "has_auth": has_auth,
-            "file": Path(cfile).name,
+            "source": source,
         }
     except Exception as e:
-        return {"active": False, "count": 0, "error": str(e), "file": Path(cfile).name}
+        return {"active": False, "count": 0, "error": str(e), "source": source}
 
 
 def format_bytes(size_bytes: Optional[float]) -> str:
@@ -448,3 +557,7 @@ def sanitize_filename(name: str) -> str:
     cleaned = re.sub(r'[\\/*?:"<>|]', "", name)
     cleaned = re.sub(r"\s+", "_", cleaned.strip())
     return cleaned[:80] or "youtube_video"
+
+
+# Run on module import (after the cookie helpers it depends on are defined)
+sanitize_environment()

@@ -9,6 +9,7 @@ import unittest
 import sys
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import utils
 from utils import (
     format_timestamp,
     parse_timestamp,
@@ -298,9 +299,15 @@ class TestYouTubeMostViewedTrimmer(unittest.TestCase):
 
     def test_sanitize_environment_and_clean_env(self):
         import os
+        from unittest import mock
         os.environ["TEST_HUGE_VAR"] = "X" * 10000
         os.environ["TEST_YOUTUBE_COOKIES"] = "# Netscape HTTP Cookie File\nexample.com\tTRUE\t/\tTRUE\t0\tk\tv"
-        sanitize_environment()
+        # Isolate tempdir so the test cookie never lands in the real env_cookies.txt
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.object(tempfile, "tempdir", tmp):
+            sanitize_environment()
+            env_cf = utils._env_cookie_path()
+            self.assertIn("\tk\tv", env_cf.read_text(encoding="utf-8"))
+            self.assertEqual(env_cf.stat().st_mode & 0o777, 0o600)
         self.assertNotIn("TEST_HUGE_VAR", os.environ)
         self.assertNotIn("TEST_YOUTUBE_COOKIES", os.environ)
         clean = get_clean_env()
@@ -553,6 +560,112 @@ class TestYouTubeMostViewedTrimmer(unittest.TestCase):
             finally:
                 srv.shutdown()
                 srv.server_close()
+
+
+class TestCookieIsolation(unittest.TestCase):
+    """Pasted cookies stay in one visitor's session; server cookies are never exposed."""
+
+    SESSION_A = "Cookie: LOGIN_INFO=alice_login; SAPISID=alice_sapisid"
+    SESSION_B = "Cookie: LOGIN_INFO=bob_login; SAPISID=bob_sapisid"
+    SERVER = ".youtube.com\tTRUE\t/\tTRUE\t1999999999\tLOGIN_INFO\toperator_login\n"
+
+    def setUp(self):
+        import os
+        from unittest import mock
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.app_root = root / "app"
+        self.app_root.mkdir()
+        self.tmpdir = root / "tmp"
+        self.tmpdir.mkdir()
+        self._session = None
+        self._patches = [
+            mock.patch.object(tempfile, "tempdir", str(self.tmpdir)),
+            mock.patch.object(utils, "APP_ROOT", self.app_root),
+            mock.patch.object(utils, "_read_session_cookies", lambda: self._session),
+            mock.patch.dict(os.environ, {}, clear=False),
+        ]
+        for p in self._patches:
+            p.start()
+        os.environ.pop(utils.SINGLE_USER_ENV, None)
+
+    def tearDown(self):
+        for p in reversed(self._patches):
+            p.stop()
+        self._tmp.cleanup()
+
+    def _set_single_user(self, on: bool):
+        import os
+        if on:
+            os.environ[utils.SINGLE_USER_ENV] = "1"
+        else:
+            os.environ.pop(utils.SINGLE_USER_ENV, None)
+
+    def test_save_does_not_write_disk_in_multi_user_mode(self):
+        sanitized = utils.save_yt_cookies(self.SESSION_A)
+        self.assertIn("alice_login", sanitized)
+        self.assertFalse((self.app_root / "user_cookies.txt").exists())
+        self.assertFalse(any("alice_login" in p.read_text(errors="ignore")
+                             for p in self.tmpdir.rglob("*") if p.is_file()))
+
+    def test_server_cookies_never_prefilled_into_session(self):
+        (self.app_root / "user_cookies.txt").write_text(self.SERVER, encoding="utf-8")
+        self.assertEqual(utils.load_persisted_cookies(), "")
+        stats = utils.get_cookie_stats()
+        self.assertTrue(stats["active"])
+        self.assertEqual(stats["source"], "server")
+
+    def test_session_cookies_override_server_and_are_isolated(self):
+        (self.app_root / "cookies.txt").write_text(self.SERVER, encoding="utf-8")
+        self._session = utils.save_yt_cookies(self.SESSION_A)
+        jar_a = Path(utils.get_yt_cookies_file())
+        self.assertEqual(utils.get_cookie_stats()["source"], "session")
+        self._session = utils.save_yt_cookies(self.SESSION_B)
+        jar_b = Path(utils.get_yt_cookies_file())
+
+        self.assertNotEqual(jar_a, jar_b)
+        self.assertIn("alice_login", jar_a.read_text(encoding="utf-8"))
+        self.assertNotIn("bob_login", jar_a.read_text(encoding="utf-8"))
+        self.assertIn("bob_login", jar_b.read_text(encoding="utf-8"))
+        for jar in (jar_a, jar_b):
+            self.assertEqual(jar.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(jar_a.parent.stat().st_mode & 0o777, 0o700)
+
+        self._session = None
+        self.assertIn("operator_login", Path(utils.get_yt_cookies_file()).read_text(encoding="utf-8"))
+
+    def test_clear_only_removes_own_cookies(self):
+        server_file = self.app_root / "cookies.txt"
+        server_file.write_text(self.SERVER, encoding="utf-8")
+        self._session = utils.save_yt_cookies(self.SESSION_A)
+        jar_a = Path(utils.get_yt_cookies_file())
+        self._session = utils.save_yt_cookies(self.SESSION_B)
+        jar_b = Path(utils.get_yt_cookies_file())
+
+        utils.clear_yt_cookies(self._session)
+        self.assertFalse(jar_b.exists())
+        self.assertTrue(jar_a.exists())
+        self.assertTrue(server_file.exists())
+
+    def test_unreadable_server_file_is_not_handed_to_ytdlp(self):
+        master = self.app_root / "user_cookies.txt"
+        master.write_bytes(b"\xff\xfe\x00 not utf-8")
+        self.assertIsNone(utils.get_yt_cookies_file())
+
+    def test_single_user_mode_persists_restores_and_clears(self):
+        self._set_single_user(True)
+        persisted = self.app_root / "user_cookies.txt"
+        sanitized = utils.save_yt_cookies(self.SESSION_A)
+        self.assertTrue(persisted.exists())
+        self.assertEqual(persisted.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(utils.load_persisted_cookies(), sanitized)
+        utils.clear_yt_cookies(sanitized)
+        self.assertFalse(persisted.exists())
+
+    def test_dockerignore_excludes_secrets(self):
+        patterns = (Path(__file__).resolve().parent.parent / ".dockerignore").read_text().split()
+        for required in ("*cookies*", ".env", ".env.*", ".streamlit/secrets.toml"):
+            self.assertIn(required, patterns)
 
 
 if __name__ == "__main__":

@@ -52,7 +52,8 @@ A Python + Streamlit web application that loads a YouTube video from its link, e
    - **Removed Conflicting Desktop User-Agent Override**: Previously, forcing a desktop Windows Chrome `User-Agent` onto mobile/embedded `player_client` URLs caused `googlevideo.com` to reject requests with `HTTP 403 Forbidden` and caused `ffmpeg` to exit with `code 8`. Client-native headers are now used.
    - **Isolated Single-Client Profiles (`_build_client_profiles`)**: The trimmer tests isolated profiles in order: cookie-authenticated `tv`, `web_creator`, `web_safari`, and `mweb`, followed by cookieless `android_vr`, `ios` (HLS), and `tv_embedded`.
    - **Added `pytubefix` Secondary Fallback Engine**: If `yt-dlp` encounters a 403 block on a cloud IP, `video_trimmer.py` automatically falls back to `pytubefix` (`ANDROID_VR`, `IOS`, `TV`, `MWEB`) to fetch and merge the stream.
-   - **Isolated Working Cookie Jar (`utils.py`)**: `yt-dlp` mutates/overwrites its `cookiefile` on disk after each run. `get_yt_cookies_file()` writes a fresh temporary working copy (`/tmp/yt_working_cookies_<pid>.txt`) before each request and supports both **Netscape** and **JSON** cookie exports (including `#HttpOnly_` lines and auto-padding 6-column lines).
+   - **Isolated Working Cookie Jar (`utils.py`)**: `yt-dlp` mutates/overwrites its `cookiefile` on disk after each run. `get_yt_cookies_file()` writes a fresh working copy (an owner-only `0600` file, named by content hash, in a `0700` temp directory) before each request and supports both **Netscape** and **JSON** cookie exports (including `#HttpOnly_` lines and auto-padding 6-column lines).
+   - **Per-Visitor Cookie Isolation**: Cookies pasted in the UI stay in that visitor's browser session only. They are never written to a shared file or shown to other visitors. Server-wide cookies come only from the operator (`st.secrets["YOUTUBE_COOKIES"]`, a `YOUTUBE_COOKIES` environment variable, or a `cookies.txt` / `user_cookies.txt` placed next to `app.py`); they are used as a fallback but never displayed or deletable from the UI.
    - **Streamlit Cloud Environment Configuration**: `runtime.txt` (`python-3.12`), `packages.txt` (`ffmpeg`, `nodejs`), and `requirements.txt` (`yt-dlp[default]`).
 
 ---
@@ -112,6 +113,11 @@ pip install -r requirements.txt
 ### 3. Run the App
 ```bash
 streamlit run app.py
+```
+
+Running it just for yourself? Enable single-user mode so cookies you paste are saved (`0600`) to `user_cookies.txt` and restored after a page refresh. Never enable this on a shared deployment.
+```bash
+YT_TRIMMER_SINGLE_USER=1 streamlit run app.py
 ```
 
 ### 4. Run Unit & Integration Tests
