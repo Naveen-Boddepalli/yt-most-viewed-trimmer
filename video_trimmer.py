@@ -5,6 +5,7 @@ import http.server
 import os
 import re
 import socket
+import ssl
 import socketserver
 import sys
 import shutil
@@ -523,10 +524,12 @@ class _IPv4HTTPConnection(http.client.HTTPConnection):
 class _IPv4HTTPSConnection(http.client.HTTPSConnection):
     def connect(self) -> None:
         sock = _create_ipv4_connection((self.host, self.port), self.timeout, self.source_address)
+        server_hostname = self.host
         if self._tunnel_host:
             self.sock = sock
             self._tunnel()
-        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+            server_hostname = self._tunnel_host
+        self.sock = self._context.wrap_socket(sock, server_hostname=server_hostname)
 
 
 class _IPv4HTTPHandler(urllib.request.HTTPHandler):
@@ -539,7 +542,16 @@ class _IPv4HTTPSHandler(urllib.request.HTTPSHandler):
         return self.do_open(_IPv4HTTPSConnection, req, context=self._context)
 
 
-_IPV4_OPENER = urllib.request.build_opener(_IPv4HTTPHandler(), _IPv4HTTPSHandler())
+def _verified_ssl_context() -> ssl.SSLContext:
+    """Certificate-verifying TLS context, using certifi's CA bundle when available."""
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
+_IPV4_OPENER = urllib.request.build_opener(_IPv4HTTPHandler(), _IPv4HTTPSHandler(context=_verified_ssl_context()))
 
 
 def _fetch_bytes_ipv4(
@@ -582,7 +594,6 @@ def _build_probe_ydl_opts(prof: Dict[str, Any], cache_dir: str) -> Dict[str, Any
         "skip_download": True,
         "ignore_no_formats_error": True,
         "cachedir": cache_dir,
-        "nocheckcertificate": True,
         "source_address": "0.0.0.0",
         "socket_timeout": 20,
         "js_runtimes": get_js_runtimes(),
@@ -1481,7 +1492,6 @@ def _build_ydl_base_opts(
         "overwrites": True,
         "source_address": "0.0.0.0",
         "cachedir": get_ytdlp_cache_dir(),
-        "nocheckcertificate": True,
         "retries": 4,
         "fragment_retries": 4,
         "file_access_retries": 3,
