@@ -583,6 +583,28 @@ class TestYouTubeMostViewedTrimmer(unittest.TestCase):
                 srv.server_close()
 
 
+class TestMoviePyFallback(unittest.TestCase):
+    def test_vertical_blur_survives_moviepy_fallback(self):
+        if not has_ffmpeg():
+            self.skipTest("FFmpeg not installed")
+        from unittest import mock
+        import video_trimmer as vt
+        ffmpeg_exe = ensure_ffmpeg()
+        with tempfile.TemporaryDirectory() as tmp:
+            src = Path(tmp) / "src.mp4"
+            subprocess.run(
+                [ffmpeg_exe, "-y", "-f", "lavfi", "-i", "testsrc=duration=3:size=640x360:rate=15",
+                 "-f", "lavfi", "-i", "sine=duration=3", "-c:v", "libx264", "-pix_fmt", "yuv420p",
+                 "-c:a", "aac", "-shortest", str(src)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True,
+            )
+            out = Path(tmp) / "out.mp4"
+            # Force the MoviePy path by making the FFmpeg CLI unavailable
+            with mock.patch.object(vt, "ensure_ffmpeg", return_value=None):
+                trim_clip_ffmpeg(src, out, 0.5, 2.5, crop_config=CropConfig(mode="9:16_blur"))
+            self.assertEqual(get_video_dimensions(out), (202, 360))
+
+
 class TestHtmlEscaping(unittest.TestCase):
     def test_escape_html(self):
         self.assertEqual(utils.escape_html('<b onclick="x">&'), "&lt;b onclick=&quot;x&quot;&gt;&amp;")

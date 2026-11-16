@@ -1932,7 +1932,9 @@ def trim_clip_ffmpeg(
         else:
             subclip = clip.subclip(start_time, safe_end)
 
-        if crop_config and crop_config.is_active and crop_config.mode != "9:16_blur":
+        if crop_config and crop_config.is_active and crop_config.mode == "9:16_blur":
+            subclip = _moviepy_vertical_blur(subclip)
+        elif crop_config and crop_config.is_active:
             w, h = subclip.size
             src_aspect = float(w) / float(max(1, h))
             x0_n, y0_n, x1_n, y1_n = compute_crop_box_normalized(crop_config, src_aspect)
@@ -1958,6 +1960,42 @@ def trim_clip_ffmpeg(
 
         subclip.write_videofile(str(output_path), **write_kwargs)
     return output_path
+
+
+def _mp(clip: Any, v2_name: str, v1_name: str, *args: Any, **kwargs: Any) -> Any:
+    """Call a MoviePy clip method by its 2.x name, falling back to the 1.x name."""
+    fn = getattr(clip, v2_name, None) or getattr(clip, v1_name)
+    return fn(*args, **kwargs)
+
+
+def _moviepy_vertical_blur(clip: Any) -> Any:
+    """
+    MoviePy equivalent of the FFmpeg `9:16_blur` filter: the full frame scaled to the
+    9:16 canvas width, centred over a blurred, darkened, cover-scaled copy of itself.
+    """
+    try:
+        from moviepy import CompositeVideoClip
+    except ImportError:
+        from moviepy.editor import CompositeVideoClip
+
+    w, h = clip.size
+    out_h = max(2, int(h) // 2 * 2)
+    out_w = max(2, int(out_h * 9 / 16) // 2 * 2)
+
+    # Background: cover-scale, centre-crop, blur via down/up-scaling, darken
+    cover = max(out_w / float(w), out_h / float(h))
+    bg = _mp(clip.without_audio(), "resized", "resize", (max(2, round(w * cover)), max(2, round(h * cover))))
+    bg = _mp(bg, "cropped", "crop", x_center=bg.size[0] / 2, y_center=bg.size[1] / 2, width=out_w, height=out_h)
+    bg = _mp(bg, "resized", "resize", (max(2, out_w // 20), max(2, out_h // 20)))
+    bg = _mp(bg, "resized", "resize", (out_w, out_h))
+    bg = _mp(bg, "image_transform", "fl_image", lambda frame: (frame * 0.88).astype("uint8"))
+
+    # Foreground: whole frame fitted to the canvas width
+    fg_h = max(2, round(h * out_w / float(w)) // 2 * 2)
+    fg = _mp(clip, "resized", "resize", (out_w, fg_h))
+    fg = _mp(fg, "with_position", "set_position", ("center", "center"))
+
+    return CompositeVideoClip([bg, fg], size=(out_w, out_h))
 
 
 def trim_selected_segments(
