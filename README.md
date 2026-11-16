@@ -28,21 +28,21 @@ A Python + Streamlit web application that loads a YouTube video from its link, e
      - `📺 4:3 Classic Crop`
      - `📐 Custom Crop Margins (%)` (independent Top, Bottom, Left, Right % sliders)
    - **Subject Focus / Horizontal & Vertical Panning**: Anchor the crop window to `Center (50%)`, `Left Subject (20%)`, `Right Subject (80%)`, or any custom horizontal/vertical percentage (`0%–100%`) with a live visual framing preview over the video thumbnail.
-   - **One-Click Re-Crop**: Change the crop settings in the sidebar and click **🔄 Re-Trim / Apply Crop** on any clip card.
+   - **One-Click Re-Crop**: Change the crop settings in the sidebar and click **Re-trim** on any clip card.
 
 3. **Interactive Engagement Curve (`app.py` + `plotly`)**
    - Plots the full 0–100% replay intensity timeline with shaded highlight windows marking each extracted segment (`#1`, `#2`, ...).
 
 4. **Pre-Download File Size Visibility & Estimation (`yt_processor.py` + `utils.py`)**
    - **Full Video Download Size**: Estimates video download size for every resolution (360p, 480p, 720p, 1080p) before downloading using stream metadata, bitrates, and duration.
-   - **Per-Segment Size Display**: Shows estimated clip size (e.g. `~3.5 MB`) in the segments table, trimming toolbar, and on clip cards before trimming, and exact trimmed file size before downloading.
+   - **Per-Segment Size Display**: Shows estimated clip size (e.g. `~3.5 MB`) on the Trim all button and on each clip card before trimming, and exact trimmed file size before downloading.
    - **Download Buttons & ZIP Size**: Shows exact sizes on individual clip download buttons and the combined `.zip` bundle button.
 
 5. **Flexible Video Trimming & Downloading (`video_trimmer.py`)**
-   - **Trim a Particular Segment**: Pick any specific rank from the dropdown (or click the inline button on any segment card) to trim, preview (`st.video`), and download just that clip (`st.download_button`).
+   - **Trim a Particular Segment**: Click **✂️ Trim** on any clip card to trim, preview (`st.video`), and download just that clip (`st.download_button`).
    - **Trim All Segments + `.zip` Bundle**: One-click batch trimming of all top $K$ segments plus a single button to download all trimmed `.mp4` files in a `.zip` archive.
    - **Custom Timestamp Range Trimmer**: Manually add and trim any `MM:SS - MM:SS` interval.
-   - **Offline Sample Demo Mode**: Click **Load Sample Heatmap Demo** in the header to test the heatmap peak detector, interactive chart, and FFmpeg video trimming immediately without needing an external link.
+   - **Offline Sample Demo Mode**: Click **Try demo** next to the URL box to test the heatmap peak detector, interactive chart, and FFmpeg video trimming immediately without needing an external link.
 
 ---
 
