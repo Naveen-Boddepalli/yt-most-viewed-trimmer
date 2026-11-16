@@ -1,4 +1,4 @@
-streamlit>=1.35.0
+streamlit>=1.36.0
 yt-dlp[default]>=2025.1.0
 deno>=2.3.0
 pytubefix>=8.0.0

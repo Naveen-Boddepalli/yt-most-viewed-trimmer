@@ -811,6 +811,65 @@ def slice_hls_playlist_to_file(
     return output_ts_path, local_offset
 
 
+def mux_trim_hls_av(
+    ffmpeg_exe: str,
+    video_ts: Path,
+    video_offset: float,
+    audio_ts: Path,
+    audio_offset: float,
+    clip_duration: float,
+    output_path: Path,
+    crop_config: Optional[CropConfig] = None,
+) -> bool:
+    """
+    Mux separately sliced HLS video/audio `.ts` files into one MP4, keeping
+    `clip_duration` seconds starting at each file's own offset.
+
+    The offsets are applied with `trim`/`atrim` after decoding rather than with
+    input-side `-ss`: FFmpeg's MPEG-TS demuxer seeks imprecisely and can land on
+    the keyframe *after* the target, which left the clip's first seconds with
+    audio but no video. The slices are only a few segments long, so decoding
+    them from the start is cheap.
+    """
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    vf_filter = build_crop_vf_filter(crop_config)
+    video_chain = f"[0:v]trim=start={video_offset:.3f},setpts=PTS-STARTPTS"
+    if vf_filter:
+        # The crop chain's first filter has no input label and its last has no
+        # output label, so it slots between the two labels below.
+        video_chain += f"[vtrim];[vtrim]{vf_filter}"
+    filter_complex = (
+        f"{video_chain}[vout];"
+        f"[1:a]atrim=start={audio_offset:.3f},asetpts=PTS-STARTPTS[aout]"
+    )
+    cmd = [
+        ffmpeg_exe, "-y",
+        "-i", str(video_ts),
+        "-i", str(audio_ts),
+        "-filter_complex", filter_complex,
+        "-map", "[vout]", "-map", "[aout]",
+        "-t", f"{clip_duration:.3f}",
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-shortest",
+        "-movflags", "+faststart",
+        str(output_path),
+    ]
+    proc = subprocess.run(
+        cmd,
+        env=get_clean_env(),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=120,
+    )
+    return proc.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0
+
+
 def _is_hls_format(f: Dict[str, Any]) -> bool:
     url_str = str(f.get("url") or "")
     proto_str = str(f.get("protocol") or "")
@@ -995,36 +1054,16 @@ def _try_python_hls_direct_slice(
                         ):
                             if progress_callback:
                                 progress_callback(0.96, "Muxing & trimming HLS slice locally...")
-                            output_path.parent.mkdir(parents=True, exist_ok=True)
-                            vf_filter = build_crop_vf_filter(crop_config)
-                            cmd = [
-                                ffmpeg_exe, "-y",
-                                "-ss", f"{v_off:.3f}", "-i", str(temp_v),
-                                "-ss", f"{a_off:.3f}", "-i", str(temp_a),
-                                "-t", f"{clip_dur:.3f}",
-                            ]
-                            if vf_filter:
-                                cmd.extend(["-vf", vf_filter])
-                            cmd.extend([
-                                "-c:v", "libx264",
-                                "-preset", "veryfast",
-                                "-crf", "23",
-                                "-pix_fmt", "yuv420p",
-                                "-c:a", "aac",
-                                "-b:a", "128k",
-                                "-shortest",
-                                "-movflags", "+faststart",
-                                str(output_path),
-                            ])
-                            proc = subprocess.run(
-                                cmd,
-                                env=get_clean_env(),
-                                stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE,
-                                text=True,
-                                timeout=120,
-                            )
-                            if proc.returncode == 0 and output_path.exists() and output_path.stat().st_size > 0:
+                            if mux_trim_hls_av(
+                                ffmpeg_exe=ffmpeg_exe,
+                                video_ts=temp_v,
+                                video_offset=v_off,
+                                audio_ts=temp_a,
+                                audio_offset=a_off,
+                                clip_duration=clip_dur,
+                                output_path=output_path,
+                                crop_config=crop_config,
+                            ):
                                 return output_path
                     finally:
                         for tmp_f in (temp_v, temp_a):
@@ -1884,13 +1923,20 @@ def trim_clip_ffmpeg(
     duration = max(0.5, end_time - start_time)
     vf_filter = build_crop_vf_filter(crop_config)
 
+    # MPEG-TS input seeking is imprecise and can jump to the keyframe after the
+    # target (losing the first seconds of video), so for .ts sources (small HLS
+    # slices) seek on the output side: decode from the start and drop frames.
+    if source_video.suffix.lower() == ".ts":
+        seek_args = ["-i", str(source_video), "-ss", f"{start_time:.3f}"]
+    else:
+        seek_args = ["-ss", f"{start_time:.3f}", "-i", str(source_video)]
+
     ffmpeg_exe = ensure_ffmpeg()
     if ffmpeg_exe:
         if fast_copy and not vf_filter:
             cmd = [
                 ffmpeg_exe, "-y",
-                "-ss", f"{start_time:.3f}",
-                "-i", str(source_video),
+                *seek_args,
                 "-t", f"{duration:.3f}",
                 "-c", "copy",
                 "-movflags", "+faststart",
@@ -1899,8 +1945,7 @@ def trim_clip_ffmpeg(
         else:
             cmd = [
                 ffmpeg_exe, "-y",
-                "-ss", f"{start_time:.3f}",
-                "-i", str(source_video),
+                *seek_args,
                 "-t", f"{duration:.3f}",
             ]
             if vf_filter:
