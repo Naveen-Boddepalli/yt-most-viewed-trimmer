@@ -39,6 +39,8 @@ from utils import (
     get_cookie_stats,
     load_persisted_cookies,
     is_single_user_mode,
+    escape_html,
+    safe_css_url,
     sanitize_environment,
     get_clean_env,
 )
@@ -254,16 +256,17 @@ def render_crop_framing_preview(crop_cfg: CropConfig, thumb_url: Optional[str] =
     width_pct = round((x1 - x0) * 100, 1)
     height_pct = round((y1 - y0) * 100, 1)
 
+    safe_thumb = safe_css_url(thumb_url)
     bg_style = (
-        f"background-image: url('{thumb_url}'); background-size: cover; background-position: center;"
-        if thumb_url
+        f"background-image: url('{safe_thumb}'); background-size: cover; background-position: center;"
+        if safe_thumb
         else "background: linear-gradient(135deg, #1E293B 0%, #334155 100%);"
     )
 
-    html = f"""
+    preview_html = f"""
     <div style="margin-top:6px; margin-bottom:10px;">
         <div style="font-size:0.80rem; color:#94A3B8; margin-bottom:4px;">
-            📐 <b>Active Crop Window:</b> {CROP_PRESETS.get(crop_cfg.mode, crop_cfg.mode)}
+            📐 <b>Active Crop Window:</b> {escape_html(CROP_PRESETS.get(crop_cfg.mode, crop_cfg.mode))}
             ({width_pct:.0f}% W × {height_pct:.0f}% H)
         </div>
         <div style="position:relative; width:100%; aspect-ratio:16/9; border-radius:8px; overflow:hidden; border:1px solid #334155; {bg_style}">
@@ -285,12 +288,12 @@ def render_crop_framing_preview(crop_cfg: CropConfig, thumb_url: Optional[str] =
                 font-size:0.78rem;
                 text-shadow:0 1px 3px rgba(0,0,0,0.9);
             ">
-                {crop_cfg.mode.upper()}
+                {escape_html(crop_cfg.mode.upper())}
             </div>
         </div>
     </div>
     """
-    st.markdown(html, unsafe_allow_html=True)
+    st.markdown(preview_html, unsafe_allow_html=True)
 
 
 # ------------------------------------------------------------------------------
@@ -1108,14 +1111,14 @@ if info:
                 card_html = (
                     f'<div class="clip-card">\n'
                     f'  <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:8px;">\n'
-                    f'    <span style="font-size:1.08rem; font-weight:700;">#{seg.rank} — {seg.time_range_str}</span>\n'
+                    f'    <span style="font-size:1.08rem; font-weight:700;">#{escape_html(seg.rank)} — {escape_html(seg.time_range_str)}</span>\n'
                     f'    <span class="score-badge">🔥 {int(round(seg.score * 100))}% Replay Score</span>\n'
                     f'  </div>\n'
                     f'  <div style="font-size:0.88rem; color:#B0BAC9; margin-bottom:6px;">\n'
                     f'    <b>Peak Moment:</b> {format_timestamp(seg.peak_time)} &nbsp;|&nbsp;\n'
                     f'    <b>Duration:</b> {seg.duration:.1f}s &nbsp;|&nbsp;\n'
                     f'    {size_badge_html} &nbsp;|&nbsp;\n'
-                    f'    <span class="source-badge">{seg.source}</span>\n'
+                    f'    <span class="source-badge">{escape_html(seg.source)}</span>\n'
                     f'    {crop_pill}\n'
                     f'  </div>\n'
                     f'</div>'

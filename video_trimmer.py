@@ -4,6 +4,7 @@ import http.client
 import http.server
 import os
 import re
+import secrets
 import socket
 import ssl
 import socketserver
@@ -1143,6 +1144,9 @@ def run_http_range_relay_trim(
     bytes_counter = {"total": 0}
     counter_lock = threading.Lock()
     stop_event = threading.Event()
+    # Unguessable per-invocation path prefix: other local processes can't use the
+    # relay to fetch signed googlevideo URLs (with our cookies/headers) while it runs.
+    route_prefix = "/" + secrets.token_urlsafe(24)
 
     class _RelayHandler(http.server.BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:
@@ -1151,10 +1155,11 @@ def run_http_range_relay_trim(
         def _handle_stream(self, send_body: bool) -> None:
             if stop_event.is_set():
                 return
-            if self.path not in stream_specs:
+            route = self.path[len(route_prefix):] if self.path.startswith(route_prefix + "/") else None
+            if route not in stream_specs:
                 self.send_error(404)
                 return
-            target_url, base_hdrs = stream_specs[self.path]
+            target_url, base_hdrs = stream_specs[route]
             hdrs = dict(base_hdrs)
             hdrs["Accept-Encoding"] = "identity"
             if "Range" in self.headers:
@@ -1228,7 +1233,7 @@ def run_http_range_relay_trim(
         vf_filter = build_crop_vf_filter(crop_config)
         cmd = [ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error"]
         for route in stream_specs:
-            cmd.extend(["-ss", f"{start_time:.3f}", "-i", f"http://127.0.0.1:{port}{route}"])
+            cmd.extend(["-ss", f"{start_time:.3f}", "-i", f"http://127.0.0.1:{port}{route_prefix}{route}"])
         cmd.extend(["-t", f"{clip_dur:.3f}"])
         if vf_filter:
             cmd.extend(["-vf", vf_filter])

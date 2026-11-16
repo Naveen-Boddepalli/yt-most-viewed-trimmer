@@ -539,27 +539,65 @@ class TestYouTubeMostViewedTrimmer(unittest.TestCase):
                 out_clip = tmp_path / "relayed_clip.mp4"
                 prog_events = []
 
+                # While the relay runs, a request without its secret path prefix must be refused
+                import re as _re
+                from unittest import mock
+                import video_trimmer as vt
+                real_popen = vt.subprocess.Popen
+                probe = {}
+
+                def _popen_with_probe(cmd, *a, **kw):
+                    relay_url = next(c for c in cmd if str(c).startswith("http://127.0.0.1:"))
+                    relay_port = int(_re.match(r"http://127\.0\.0\.1:(\d+)/", relay_url).group(1))
+                    try:
+                        urllib.request.urlopen(f"http://127.0.0.1:{relay_port}/m", timeout=5)
+                        probe["status"] = 200
+                    except urllib.error.HTTPError as err:
+                        probe["status"] = err.code
+                    probe["token_len"] = len(relay_url.split("/")[3])
+                    return real_popen(cmd, *a, **kw)
+
                 def _open_fn(t_url, hdrs):
                     req = urllib.request.Request(t_url, headers=hdrs)
                     return urllib.request.urlopen(req, timeout=10)
 
-                run_http_range_relay_trim(
-                    ffmpeg_exe=ffmpeg_exe,
-                    output_path=out_clip,
-                    start_time=1.5,
-                    end_time=4.0,
-                    open_url_fn=_open_fn,
-                    stream_specs={"/m": (f"http://127.0.0.1:{port}/video.mp4", {})},
-                    crop_config=CropConfig(mode="1:1", pan_x=0.5),
-                    progress_callback=lambda p, m: prog_events.append((p, m)),
-                )
+                with mock.patch.object(vt.subprocess, "Popen", _popen_with_probe):
+                    run_http_range_relay_trim(
+                        ffmpeg_exe=ffmpeg_exe,
+                        output_path=out_clip,
+                        start_time=1.5,
+                        end_time=4.0,
+                        open_url_fn=_open_fn,
+                        stream_specs={"/m": (f"http://127.0.0.1:{port}/video.mp4", {})},
+                        crop_config=CropConfig(mode="1:1", pan_x=0.5),
+                        progress_callback=lambda p, m: prog_events.append((p, m)),
+                    )
                 self.assertTrue(out_clip.exists())
                 self.assertGreater(out_clip.stat().st_size, 1000)
                 self.assertEqual(get_video_dimensions(out_clip), (360, 360))
                 self.assertGreaterEqual(len(prog_events), 1)
+                self.assertEqual(probe["status"], 404)
+                self.assertGreaterEqual(probe["token_len"], 24)
             finally:
                 srv.shutdown()
                 srv.server_close()
+
+
+class TestHtmlEscaping(unittest.TestCase):
+    def test_escape_html(self):
+        self.assertEqual(utils.escape_html('<b onclick="x">&'), "&lt;b onclick=&quot;x&quot;&gt;&amp;")
+        self.assertEqual(utils.escape_html(3), "3")
+
+    def test_safe_css_url(self):
+        ok = utils.safe_css_url("https://i.ytimg.com/vi/abc/maxresdefault.jpg")
+        self.assertEqual(ok, "https://i.ytimg.com/vi/abc/maxresdefault.jpg")
+        hostile = utils.safe_css_url("https://i.ytimg.com/a.jpg?x=');background:url(evil)\"><script>")
+        for ch in ("'", '"', "(", ")", "<", ">", " "):
+            self.assertNotIn(ch, hostile)
+        self.assertIsNone(utils.safe_css_url("javascript:alert(1)"))
+        self.assertIsNone(utils.safe_css_url("data:image/png;base64,AAAA"))
+        self.assertIsNone(utils.safe_css_url(""))
+        self.assertIsNone(utils.safe_css_url(None))
 
 
 class TestCookieIsolation(unittest.TestCase):
