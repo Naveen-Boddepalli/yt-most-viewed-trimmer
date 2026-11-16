@@ -1,12 +1,14 @@
 """Utility functions for timestamp formatting, validation, size formatting, cookie handling, and file cleanup."""
 
 import hashlib
+import html
 import json
 import os
 import re
 import shutil
 import tempfile
 import time
+import urllib.parse
 from pathlib import Path
 from typing import Tuple, Optional, Dict, Any, List
 
@@ -558,6 +560,23 @@ def sanitize_filename(name: str) -> str:
     cleaned = re.sub(r"\s+", "_", cleaned.strip())
     return cleaned[:80] or "youtube_video"
 
+
+def escape_html(value: Any) -> str:
+    """HTML-escape any value before interpolating it into unsafe_allow_html markup."""
+    return html.escape(str(value), quote=True)
+
+
+def safe_css_url(url: Optional[str]) -> Optional[str]:
+    """
+    Return an http(s) URL percent-encoded so it cannot break out of a CSS
+    `url('...')` value or its surrounding HTML attribute; None for anything else.
+    """
+    if not url:
+        return None
+    parsed = urllib.parse.urlsplit(str(url).strip())
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        return None
+    return urllib.parse.quote(urllib.parse.urlunsplit(parsed), safe=":/?&=%#+,;@~-._")
 
 # Run on module import (after the cookie helpers it depends on are defined)
 sanitize_environment()

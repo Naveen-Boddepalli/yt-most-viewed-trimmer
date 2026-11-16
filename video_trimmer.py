@@ -4,7 +4,9 @@ import http.client
 import http.server
 import os
 import re
+import secrets
 import socket
+import ssl
 import socketserver
 import sys
 import shutil
@@ -523,10 +525,12 @@ class _IPv4HTTPConnection(http.client.HTTPConnection):
 class _IPv4HTTPSConnection(http.client.HTTPSConnection):
     def connect(self) -> None:
         sock = _create_ipv4_connection((self.host, self.port), self.timeout, self.source_address)
+        server_hostname = self.host
         if self._tunnel_host:
             self.sock = sock
             self._tunnel()
-        self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+            server_hostname = self._tunnel_host
+        self.sock = self._context.wrap_socket(sock, server_hostname=server_hostname)
 
 
 class _IPv4HTTPHandler(urllib.request.HTTPHandler):
@@ -539,7 +543,16 @@ class _IPv4HTTPSHandler(urllib.request.HTTPSHandler):
         return self.do_open(_IPv4HTTPSConnection, req, context=self._context)
 
 
-_IPV4_OPENER = urllib.request.build_opener(_IPv4HTTPHandler(), _IPv4HTTPSHandler())
+def _verified_ssl_context() -> ssl.SSLContext:
+    """Certificate-verifying TLS context, using certifi's CA bundle when available."""
+    try:
+        import certifi
+        return ssl.create_default_context(cafile=certifi.where())
+    except Exception:
+        return ssl.create_default_context()
+
+
+_IPV4_OPENER = urllib.request.build_opener(_IPv4HTTPHandler(), _IPv4HTTPSHandler(context=_verified_ssl_context()))
 
 
 def _fetch_bytes_ipv4(
@@ -582,7 +595,6 @@ def _build_probe_ydl_opts(prof: Dict[str, Any], cache_dir: str) -> Dict[str, Any
         "skip_download": True,
         "ignore_no_formats_error": True,
         "cachedir": cache_dir,
-        "nocheckcertificate": True,
         "source_address": "0.0.0.0",
         "socket_timeout": 20,
         "js_runtimes": get_js_runtimes(),
@@ -1132,6 +1144,9 @@ def run_http_range_relay_trim(
     bytes_counter = {"total": 0}
     counter_lock = threading.Lock()
     stop_event = threading.Event()
+    # Unguessable per-invocation path prefix: other local processes can't use the
+    # relay to fetch signed googlevideo URLs (with our cookies/headers) while it runs.
+    route_prefix = "/" + secrets.token_urlsafe(24)
 
     class _RelayHandler(http.server.BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: Any) -> None:
@@ -1140,10 +1155,11 @@ def run_http_range_relay_trim(
         def _handle_stream(self, send_body: bool) -> None:
             if stop_event.is_set():
                 return
-            if self.path not in stream_specs:
+            route = self.path[len(route_prefix):] if self.path.startswith(route_prefix + "/") else None
+            if route not in stream_specs:
                 self.send_error(404)
                 return
-            target_url, base_hdrs = stream_specs[self.path]
+            target_url, base_hdrs = stream_specs[route]
             hdrs = dict(base_hdrs)
             hdrs["Accept-Encoding"] = "identity"
             if "Range" in self.headers:
@@ -1217,7 +1233,7 @@ def run_http_range_relay_trim(
         vf_filter = build_crop_vf_filter(crop_config)
         cmd = [ffmpeg_exe, "-y", "-hide_banner", "-loglevel", "error"]
         for route in stream_specs:
-            cmd.extend(["-ss", f"{start_time:.3f}", "-i", f"http://127.0.0.1:{port}{route}"])
+            cmd.extend(["-ss", f"{start_time:.3f}", "-i", f"http://127.0.0.1:{port}{route_prefix}{route}"])
         cmd.extend(["-t", f"{clip_dur:.3f}"])
         if vf_filter:
             cmd.extend(["-vf", vf_filter])
@@ -1481,7 +1497,6 @@ def _build_ydl_base_opts(
         "overwrites": True,
         "source_address": "0.0.0.0",
         "cachedir": get_ytdlp_cache_dir(),
-        "nocheckcertificate": True,
         "retries": 4,
         "fragment_retries": 4,
         "file_access_retries": 3,
@@ -1736,7 +1751,7 @@ def download_single_clip_section(
                         source_video=produced_file,
                         output_path=output_path,
                         start_time=0.0,
-                        end_time=clip_dur + 5.0,
+                        end_time=clip_dur,
                         fast_copy=False,
                         crop_config=crop_config,
                     )
@@ -1917,7 +1932,9 @@ def trim_clip_ffmpeg(
         else:
             subclip = clip.subclip(start_time, safe_end)
 
-        if crop_config and crop_config.is_active and crop_config.mode != "9:16_blur":
+        if crop_config and crop_config.is_active and crop_config.mode == "9:16_blur":
+            subclip = _moviepy_vertical_blur(subclip)
+        elif crop_config and crop_config.is_active:
             w, h = subclip.size
             src_aspect = float(w) / float(max(1, h))
             x0_n, y0_n, x1_n, y1_n = compute_crop_box_normalized(crop_config, src_aspect)
@@ -1943,6 +1960,42 @@ def trim_clip_ffmpeg(
 
         subclip.write_videofile(str(output_path), **write_kwargs)
     return output_path
+
+
+def _mp(clip: Any, v2_name: str, v1_name: str, *args: Any, **kwargs: Any) -> Any:
+    """Call a MoviePy clip method by its 2.x name, falling back to the 1.x name."""
+    fn = getattr(clip, v2_name, None) or getattr(clip, v1_name)
+    return fn(*args, **kwargs)
+
+
+def _moviepy_vertical_blur(clip: Any) -> Any:
+    """
+    MoviePy equivalent of the FFmpeg `9:16_blur` filter: the full frame scaled to the
+    9:16 canvas width, centred over a blurred, darkened, cover-scaled copy of itself.
+    """
+    try:
+        from moviepy import CompositeVideoClip
+    except ImportError:
+        from moviepy.editor import CompositeVideoClip
+
+    w, h = clip.size
+    out_h = max(2, int(h) // 2 * 2)
+    out_w = max(2, int(out_h * 9 / 16) // 2 * 2)
+
+    # Background: cover-scale, centre-crop, blur via down/up-scaling, darken
+    cover = max(out_w / float(w), out_h / float(h))
+    bg = _mp(clip.without_audio(), "resized", "resize", (max(2, round(w * cover)), max(2, round(h * cover))))
+    bg = _mp(bg, "cropped", "crop", x_center=bg.size[0] / 2, y_center=bg.size[1] / 2, width=out_w, height=out_h)
+    bg = _mp(bg, "resized", "resize", (max(2, out_w // 20), max(2, out_h // 20)))
+    bg = _mp(bg, "resized", "resize", (out_w, out_h))
+    bg = _mp(bg, "image_transform", "fl_image", lambda frame: (frame * 0.88).astype("uint8"))
+
+    # Foreground: whole frame fitted to the canvas width
+    fg_h = max(2, round(h * out_w / float(w)) // 2 * 2)
+    fg = _mp(clip, "resized", "resize", (out_w, fg_h))
+    fg = _mp(fg, "with_position", "set_position", ("center", "center"))
+
+    return CompositeVideoClip([bg, fg], size=(out_w, out_h))
 
 
 def trim_selected_segments(

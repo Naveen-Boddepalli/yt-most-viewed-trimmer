@@ -103,7 +103,6 @@ def fetch_video_metadata(url: str, cookies_file: Optional[str] = None) -> Dict[s
             "extract_flat": False,
             "ignore_no_formats_error": True,
             "cachedir": cache_dir,
-            "nocheckcertificate": True,
             "source_address": "0.0.0.0",
             "socket_timeout": 25,
             "js_runtimes": js_runtimes,
