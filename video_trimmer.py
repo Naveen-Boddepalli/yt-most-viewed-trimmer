@@ -1751,7 +1751,7 @@ def download_single_clip_section(
                         source_video=produced_file,
                         output_path=output_path,
                         start_time=0.0,
-                        end_time=clip_dur + 5.0,
+                        end_time=clip_dur,
                         fast_copy=False,
                         crop_config=crop_config,
                     )

@@ -67,7 +67,6 @@ try:
         get_ffmpeg_diagnostics,
         download_full_video,
         download_single_clip_section,
-        download_and_trim_segments_direct,
         trim_clip_ffmpeg,
         trim_selected_segments,
         create_clips_zip,
@@ -87,7 +86,6 @@ except ImportError:
         get_ffmpeg_diagnostics,
         download_full_video,
         download_single_clip_section,
-        download_and_trim_segments_direct,
         trim_clip_ffmpeg,
         trim_selected_segments,
         create_clips_zip,
@@ -426,11 +424,15 @@ with st.sidebar:
         options=[360, 480, 720, 1080],
         index=2,
         format_func=_res_label,
+        # Stable key: the option labels change once a video loads (size estimates),
+        # which would otherwise give the widget a new identity and reset it to 720p.
+        key="max_resolution_select",
     )
 
     if info_loaded:
         src_path_val = st.session_state.get("source_video_path")
-        if src_path_val and Path(src_path_val).exists():
+        src_height_ok = info_loaded.get("is_demo") or st.session_state.get("source_video_height") == max_resolution
+        if src_path_val and Path(src_path_val).exists() and src_height_ok:
             actual_sz = Path(src_path_val).stat().st_size
             st.caption(f"💾 **Source video downloaded:** {format_bytes(actual_sz)}")
         else:
@@ -686,6 +688,23 @@ if analyze_clicked:
 # ------------------------------------------------------------------------------
 # Display Extracted Metadata, Heatmap & Trimming Controls
 # ------------------------------------------------------------------------------
+def get_valid_source_path() -> Optional[Path]:
+    """Downloaded source video, unless it was fetched at a different max resolution."""
+    existing = st.session_state.get("source_video_path")
+    if not existing or not Path(existing).exists():
+        return None
+    if (st.session_state.get("video_info") or {}).get("is_demo"):
+        return Path(existing)
+    if st.session_state.get("source_video_height") != max_resolution:
+        return None
+    return Path(existing)
+
+
+def raw_clip_cache_key(seg: HighlightSegment, height: int) -> str:
+    """Raw (uncropped) clip cache key: same segment window AND same download resolution."""
+    return f"{seg.rank}|{seg.start_time:.2f}|{seg.end_time:.2f}|{height}p"
+
+
 info = st.session_state.get("video_info")
 segments: List[HighlightSegment] = st.session_state.get("segments", [])
 
@@ -705,8 +724,8 @@ if info:
     with meta_col2:
         st.subheader(info.get("title", "Untitled YouTube Video"))
         duration = float(info.get("duration") or 0.0)
-        src_path_existing = st.session_state.get("source_video_path")
-        is_src_downloaded = bool(src_path_existing and Path(src_path_existing).exists())
+        src_path_existing = get_valid_source_path()
+        is_src_downloaded = src_path_existing is not None
 
         if is_src_downloaded:
             source_size_bytes = Path(src_path_existing).stat().st_size
@@ -863,9 +882,9 @@ if info:
         # Helper to ensure source video is downloaded (or generated in demo mode)
         def ensure_source_video() -> Path:
             ws = Path(st.session_state["workspace_dir"])
-            existing = st.session_state.get("source_video_path")
-            if existing and Path(existing).exists():
-                return Path(existing)
+            existing = get_valid_source_path()
+            if existing:
+                return existing
 
             if info.get("is_demo"):
                 demo_mp4 = ws / "demo_source.mp4"
@@ -897,6 +916,7 @@ if info:
             )
             prog_bar.empty()
             st.session_state["source_video_path"] = dl_path
+            st.session_state["source_video_height"] = max_resolution
             return dl_path
 
         def show_trim_error(prefix: str, exc: Exception):
@@ -909,16 +929,22 @@ if info:
                     "If the video is age-restricted or private, export a fresh `cookies.txt` using the free 'Get cookies.txt LOCALLY' extension while logged into YouTube and paste it into **🍪 YouTube Cookies / Bot Bypass** in the sidebar."
                 )
 
-        def trim_single_segment_smart(target_seg: HighlightSegment):
+        def rebuild_zip_bundle():
+            ws = Path(st.session_state["workspace_dir"])
+            zip_path = ws / f"{sanitize_filename(info.get('title', 'video'))}_most_viewed_clips.zip"
+            create_clips_zip(st.session_state["trimmed_clips"], zip_path)
+            st.session_state["all_clips_zip_path"] = zip_path
+
+        def trim_single_segment_smart(target_seg: HighlightSegment, rebuild_zip: bool = True):
             ws = Path(st.session_state["workspace_dir"])
             clips_dir = ws / "trimmed_clips"
             raw_dir = ws / "raw_clips_cache"
             clips_dir.mkdir(parents=True, exist_ok=True)
             raw_dir.mkdir(parents=True, exist_ok=True)
 
-            existing_src = st.session_state.get("source_video_path")
-            has_src = bool(existing_src and Path(existing_src).exists())
-            cached_raw = st.session_state.get("raw_clips", {}).get(target_seg.rank)
+            has_src = get_valid_source_path() is not None
+            raw_key = raw_clip_cache_key(target_seg, max_resolution)
+            cached_raw = st.session_state.setdefault("raw_clips", {}).get(raw_key)
             has_cached_raw = bool(cached_raw and Path(cached_raw).exists() and Path(cached_raw).stat().st_size > 0)
 
             safe_title = sanitize_filename(info.get("title", "video"))
@@ -935,7 +961,7 @@ if info:
                         source_video=Path(cached_raw),
                         output_path=clip_path,
                         start_time=0.0,
-                        end_time=target_seg.duration + 5.0,
+                        end_time=target_seg.duration,
                         fast_copy=not active_crop_config.is_active,
                         crop_config=active_crop_config,
                     )
@@ -952,7 +978,7 @@ if info:
                         crop_config=active_crop_config,
                     )
             else:
-                raw_clip_path = raw_dir / f"{safe_title}_rank{target_seg.rank}_{start_tag}_to_{end_tag}_raw.mp4"
+                raw_clip_path = raw_dir / f"{safe_title}_rank{target_seg.rank}_{start_tag}_to_{end_tag}_{max_resolution}p_raw.mp4"
                 prog_bar = st.progress(0.0, text=f"Direct streaming clip #{target_seg.rank} ({target_seg.time_range_str})...")
                 try:
                     download_single_clip_section(
@@ -965,14 +991,14 @@ if info:
                         progress_callback=lambda p, msg: prog_bar.progress(max(0.0, min(1.0, float(p))), text=msg),
                     )
                     prog_bar.empty()
-                    st.session_state["raw_clips"][target_seg.rank] = raw_clip_path
+                    st.session_state["raw_clips"][raw_key] = raw_clip_path
                     if active_crop_config.is_active:
                         with st.spinner(f"Applying {active_crop_config.mode} crop to Clip #{target_seg.rank}..."):
                             trim_clip_ffmpeg(
                                 source_video=raw_clip_path,
                                 output_path=clip_path,
                                 start_time=0.0,
-                                end_time=target_seg.duration + 5.0,
+                                end_time=target_seg.duration,
                                 fast_copy=False,
                                 crop_config=active_crop_config,
                             )
@@ -993,46 +1019,29 @@ if info:
                     )
 
             st.session_state["trimmed_clips"].update(trimmed_map)
-            zip_path = ws / f"{sanitize_filename(info.get('title', 'video'))}_most_viewed_clips.zip"
-            create_clips_zip(st.session_state["trimmed_clips"], zip_path)
-            st.session_state["all_clips_zip_path"] = zip_path
+            if rebuild_zip:
+                rebuild_zip_bundle()
+            return trimmed_map
 
         # Execute Trim All
         if trim_all_clicked:
             try:
                 ws = Path(st.session_state["workspace_dir"])
                 clips_dir = ws / "trimmed_clips"
-                existing_src = st.session_state.get("source_video_path")
-                has_src = bool(existing_src and Path(existing_src).exists())
+                has_src = get_valid_source_path() is not None
 
                 if is_direct_stream_trim and not has_src and not info.get("is_demo"):
+                    # Per-clip smart path: caches each uncropped raw clip so later
+                    # re-crops are local, and falls back to a full download if needed.
                     prog = st.progress(0.0, text="Direct streaming highlight clips (~10-15 MB each)...")
-                    def _on_trim_prog(idx: int, total: int, msg: str):
-                        prog.progress(max(0.0, min(1.0, idx / max(1, total))), text=msg)
-                    try:
-                        trimmed_map = download_and_trim_segments_direct(
-                            url=st.session_state["video_url"],
-                            segments=segments,
-                            clips_dir=clips_dir,
-                            video_title=info.get("title", "video"),
-                            max_height=max_resolution,
-                            crop_config=active_crop_config,
-                            progress_callback=_on_trim_prog,
+                    trimmed_map = {}
+                    for clip_idx, seg_item in enumerate(segments, start=1):
+                        prog.progress(
+                            (clip_idx - 1) / max(1, len(segments)),
+                            text=f"Clip #{seg_item.rank} ({seg_item.time_range_str}) [{clip_idx}/{len(segments)}]...",
                         )
-                        prog.empty()
-                    except Exception:
-                        prog.empty()
-                        st.info("Switching to full video stream download fallback...")
-                        src_path = ensure_source_video()
-                        trimmed_map = trim_selected_segments(
-                            source_video=src_path,
-                            segments=segments,
-                            clips_dir=clips_dir,
-                            video_title=info.get("title", "video"),
-                            fast_copy=fast_copy_mode,
-                            crop_config=active_crop_config,
-                            progress_callback=_on_trim_prog,
-                        )
+                        trimmed_map.update(trim_single_segment_smart(seg_item, rebuild_zip=False))
+                    prog.empty()
                 else:
                     src_path = ensure_source_video()
                     prog = st.progress(0.0, text="Trimming highlight clips...")
@@ -1050,9 +1059,7 @@ if info:
                     prog.empty()
 
                 st.session_state["trimmed_clips"].update(trimmed_map)
-                zip_path = ws / f"{sanitize_filename(info.get('title', 'video'))}_most_viewed_clips.zip"
-                create_clips_zip(st.session_state["trimmed_clips"], zip_path)
-                st.session_state["all_clips_zip_path"] = zip_path
+                rebuild_zip_bundle()
                 st.success(f"Successfully trimmed all {len(trimmed_map)} most-viewed clips!")
             except Exception as exc:
                 show_trim_error("Error while trimming clips", exc)
