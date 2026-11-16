@@ -157,6 +157,7 @@ def init_session_state():
         "segments": [],
         "source_video_path": None,
         "trimmed_clips": {},       # rank -> Path
+        "clip_crops": {},          # rank -> {"mode", "tag"} actually encoded into that clip
         "raw_clips": {},           # rank -> uncropped Path (for instant re-cropping)
         "all_clips_zip_path": None,
         "workspace_dir": tempfile.mkdtemp(prefix="yt_trimmer_"),
@@ -535,6 +536,7 @@ with st.sidebar:
         st.session_state["segments"] = []
         st.session_state["source_video_path"] = None
         st.session_state["trimmed_clips"] = {}
+        st.session_state["clip_crops"] = {}
         st.session_state["raw_clips"] = {}
         st.session_state["all_clips_zip_path"] = None
         st.rerun()
@@ -629,6 +631,7 @@ if demo_clicked:
         padding_seconds=float(padding_sec),
     )
     st.session_state["trimmed_clips"] = {}
+    st.session_state["clip_crops"] = {}
     st.session_state["raw_clips"] = {}
     st.session_state["all_clips_zip_path"] = None
 
@@ -643,6 +646,7 @@ if analyze_clicked:
                 st.session_state["video_info"] = info
                 st.session_state["source_video_path"] = None
                 st.session_state["trimmed_clips"] = {}
+                st.session_state["clip_crops"] = {}
                 st.session_state["raw_clips"] = {}
                 st.session_state["all_clips_zip_path"] = None
 
@@ -688,6 +692,18 @@ if analyze_clicked:
 # ------------------------------------------------------------------------------
 # Display Extracted Metadata, Heatmap & Trimming Controls
 # ------------------------------------------------------------------------------
+def record_trimmed_clips(trimmed_map: Dict[int, Path], crop_cfg: CropConfig) -> None:
+    """Store trimmed clip paths along with the crop actually encoded into each file."""
+    st.session_state["trimmed_clips"].update(trimmed_map)
+    encoded = {
+        "mode": crop_cfg.mode if crop_cfg.is_active else "none",
+        "tag": crop_cfg.file_tag if crop_cfg.is_active else "",
+    }
+    crops = st.session_state.setdefault("clip_crops", {})
+    for rank in trimmed_map:
+        crops[rank] = dict(encoded)
+
+
 def get_valid_source_path() -> Optional[Path]:
     """Downloaded source video, unless it was fetched at a different max resolution."""
     existing = st.session_state.get("source_video_path")
@@ -761,13 +777,52 @@ if info:
     # --------------------------------------------------------------------------
     st.subheader("🔥 Extracted Most-Viewed Timestamp Segments")
 
+    def render_custom_clip_expander():
+        """Custom range trimmer. Adds the segment and queues it to be trimmed on the next run."""
+        with st.expander("➕ Or Trim a Custom Timestamp Range Manually", expanded=not segments):
+            c_col1, c_col2, c_col3 = st.columns([2, 2, 2])
+            with c_col1:
+                custom_start_str = st.text_input("Start Timestamp (MM:SS)", value="00:15")
+            with c_col2:
+                custom_end_str = st.text_input("End Timestamp (MM:SS)", value="00:35")
+            with c_col3:
+                st.write("")
+                custom_trim_clicked = st.button("✂️ Add & Trim Custom Clip", **STRETCH_WIDTH)
+
+            if custom_trim_clicked:
+                try:
+                    c_start = parse_timestamp(custom_start_str)
+                    c_end = parse_timestamp(custom_end_str)
+                    max_dur = float(info.get("duration") or 0.0)
+                    if c_end <= c_start or c_start < 0 or (max_dur > 0 and c_end > max_dur):
+                        st.warning("Ensure `0 <= Start < End <= Video Duration`.")
+                    else:
+                        new_rank = max([s.rank for s in segments], default=0) + 1
+                        custom_seg = HighlightSegment(
+                            rank=new_rank,
+                            start_time=round(c_start, 2),
+                            end_time=round(c_end, 2),
+                            peak_time=round((c_start + c_end) / 2.0, 2),
+                            score=1.0,
+                            source="custom",
+                            label=f"Custom Clip #{new_rank}",
+                        )
+                        st.session_state["segments"].append(custom_seg)
+                        st.session_state["_pending_custom_trim_rank"] = new_rank
+                        st.rerun()
+                except ValueError as err:
+                    st.error(str(err))
+
     if segments:
         trimmed_clips_map: Dict[int, Path] = st.session_state.get("trimmed_clips", {})
         df_rows = []
+        clip_crops_map: Dict[int, Dict[str, str]] = st.session_state.get("clip_crops", {})
         for seg in segments:
             clip_file = trimmed_clips_map.get(seg.rank)
+            row_crop_mode = active_crop_config.mode if active_crop_config.is_active else "none"
             if clip_file and Path(clip_file).exists():
                 c_sz_str = f"✅ {format_bytes(Path(clip_file).stat().st_size)}"
+                row_crop_mode = clip_crops_map.get(seg.rank, {}).get("mode", "none")
             else:
                 c_est = estimate_clip_size(seg.duration, duration, source_size_bytes)
                 c_sz_str = f"~{format_bytes(c_est)}"
@@ -780,7 +835,7 @@ if info:
                 "Peak Moment": format_timestamp(seg.peak_time),
                 "Duration (s)": f"{seg.duration:.1f}s",
                 "Est. Clip Size": c_sz_str,
-                "Crop Mode": CROP_PRESETS.get(active_crop_config.mode, "Original"),
+                "Crop Mode": CROP_PRESETS.get(row_crop_mode, "Original"),
                 "Replay Intensity": f"{int(round(seg.score * 100))}%",
                 "Source": seg.source,
             })
@@ -846,38 +901,7 @@ if info:
             )
 
         # Optional custom manual timestamp trimmer expander
-        with st.expander("➕ Or Trim a Custom Timestamp Range Manually"):
-            c_col1, c_col2, c_col3 = st.columns([2, 2, 2])
-            with c_col1:
-                custom_start_str = st.text_input("Start Timestamp (MM:SS)", value="00:15")
-            with c_col2:
-                custom_end_str = st.text_input("End Timestamp (MM:SS)", value="00:35")
-            with c_col3:
-                st.write("")
-                custom_trim_clicked = st.button("✂️ Add & Trim Custom Clip", **STRETCH_WIDTH)
-
-            if custom_trim_clicked:
-                try:
-                    c_start = parse_timestamp(custom_start_str)
-                    c_end = parse_timestamp(custom_end_str)
-                    max_dur = float(info.get("duration") or 0.0)
-                    if c_end <= c_start or c_start < 0 or (max_dur > 0 and c_end > max_dur):
-                        st.warning("Ensure `0 <= Start < End <= Video Duration`.")
-                    else:
-                        new_rank = max([s.rank for s in segments], default=0) + 1
-                        custom_seg = HighlightSegment(
-                            rank=new_rank,
-                            start_time=round(c_start, 2),
-                            end_time=round(c_end, 2),
-                            peak_time=round((c_start + c_end) / 2.0, 2),
-                            score=1.0,
-                            source="custom",
-                            label=f"Custom Clip #{new_rank}",
-                        )
-                        st.session_state["segments"].append(custom_seg)
-                        st.rerun()
-                except ValueError as err:
-                    st.error(str(err))
+        render_custom_clip_expander()
 
         # Helper to ensure source video is downloaded (or generated in demo mode)
         def ensure_source_video() -> Path:
@@ -1018,7 +1042,7 @@ if info:
                         crop_config=active_crop_config,
                     )
 
-            st.session_state["trimmed_clips"].update(trimmed_map)
+            record_trimmed_clips(trimmed_map, active_crop_config)
             if rebuild_zip:
                 rebuild_zip_bundle()
             return trimmed_map
@@ -1057,12 +1081,23 @@ if info:
                         progress_callback=_on_trim_prog,
                     )
                     prog.empty()
+                    record_trimmed_clips(trimmed_map, active_crop_config)
 
-                st.session_state["trimmed_clips"].update(trimmed_map)
                 rebuild_zip_bundle()
                 st.success(f"Successfully trimmed all {len(trimmed_map)} most-viewed clips!")
             except Exception as exc:
                 show_trim_error("Error while trimming clips", exc)
+
+        # Trim a custom clip queued by "Add & Trim Custom Clip" on the previous run
+        pending_custom_rank = st.session_state.pop("_pending_custom_trim_rank", None)
+        if pending_custom_rank is not None:
+            pending_seg = next((s for s in segments if s.rank == pending_custom_rank), None)
+            if pending_seg:
+                try:
+                    trim_single_segment_smart(pending_seg)
+                    st.success(f"Trimmed Custom Clip #{pending_seg.rank} ({pending_seg.time_range_str})!")
+                except Exception as exc:
+                    show_trim_error(f"Error trimming custom clip #{pending_seg.rank}", exc)
 
         # Execute Trim Single Particular Clip
         if trim_single_clicked:
@@ -1109,11 +1144,22 @@ if info:
 
                 dims = get_video_dimensions(Path(clip_file)) if is_trimmed else None
                 dims_str = f" ({dims[0]}×{dims[1]})" if dims else ""
-                crop_pill = (
-                    f"&nbsp;|&nbsp; <span class='crop-badge'>📐 {active_crop_config.mode}{dims_str}</span>"
-                    if (active_crop_config.is_active or dims)
-                    else ""
-                )
+                sidebar_tag = active_crop_config.file_tag if active_crop_config.is_active else ""
+                if is_trimmed:
+                    # Badge shows the crop encoded into the saved file, not the sidebar selection
+                    encoded_crop = st.session_state.get("clip_crops", {}).get(seg.rank, {"mode": "none", "tag": ""})
+                    encoded_label = encoded_crop["mode"] if encoded_crop["mode"] != "none" else "original"
+                    crop_pill = f"&nbsp;|&nbsp; <span class='crop-badge'>📐 {escape_html(encoded_label)}{dims_str}</span>"
+                    if encoded_crop.get("tag", "") != sidebar_tag:
+                        pending_label = active_crop_config.mode if active_crop_config.is_active else "original"
+                        crop_pill += (
+                            f" <span style='color:#F59E0B;'>(sidebar: {escape_html(pending_label)} — "
+                            f"Re-Trim to apply)</span>"
+                        )
+                elif active_crop_config.is_active:
+                    crop_pill = f"&nbsp;|&nbsp; <span class='crop-badge'>📐 {escape_html(active_crop_config.mode)}</span>"
+                else:
+                    crop_pill = ""
 
                 card_html = (
                     f'<div class="clip-card">\n'
@@ -1172,3 +1218,6 @@ if info:
                             st.rerun()
                         except Exception as exc:
                             show_trim_error(f"Error trimming Clip #{seg.rank}", exc)
+    else:
+        st.info("No highlight segments were found for this video. Add a custom time range below to trim it manually.")
+        render_custom_clip_expander()
