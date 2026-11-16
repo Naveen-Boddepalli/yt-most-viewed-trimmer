@@ -52,6 +52,7 @@ from video_trimmer import (
     run_http_range_relay_trim,
     get_video_dimensions,
     slice_hls_playlist_to_file,
+    mux_trim_hls_av,
 )
 
 
@@ -581,6 +582,77 @@ class TestYouTubeMostViewedTrimmer(unittest.TestCase):
             finally:
                 srv.shutdown()
                 srv.server_close()
+
+
+def _first_video_pts_seconds(ffmpeg_exe: str, path: Path) -> float:
+    """Presentation time of the first video packet (framemd5 uses the stream time base)."""
+    out = subprocess.run(
+        [ffmpeg_exe, "-v", "error", "-i", str(path), "-map", "0:v", "-c", "copy", "-f", "framemd5", "-"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True,
+    ).stdout
+    tb_line = next(l for l in out.splitlines() if l.startswith("#tb"))
+    num, den = tb_line.split(":")[1].strip().split("/")
+    first = next(l for l in out.splitlines() if l and not l.startswith("#"))
+    return int(first.split(",")[1]) * int(num) / int(den)
+
+
+def _media_duration(ffmpeg_exe: str, path: Path) -> float:
+    err = subprocess.run([ffmpeg_exe, "-hide_banner", "-i", str(path)], stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, text=True).stderr
+    hms = err.split("Duration: ")[1].split(",")[0]
+    h, m, sec = hms.split(":")
+    return int(h) * 3600 + int(m) * 60 + float(sec)
+
+
+class TestHlsTsSeekAccuracy(unittest.TestCase):
+    """YouTube HLS slices are .ts files with ~5s GOPs and non-zero start timestamps.
+    Input-side -ss on them jumped to the next keyframe, so clips opened with seconds
+    of audio but no video."""
+
+    def setUp(self):
+        if not has_ffmpeg():
+            self.skipTest("FFmpeg not installed")
+        self.ffmpeg = ensure_ffmpeg()
+        self._tmp = tempfile.TemporaryDirectory()
+        self.tmp = Path(self._tmp.name)
+        common = ["-output_ts_offset", "500", "-f", "mpegts"]
+        self.v_ts = self.tmp / "v.ts"
+        self.a_ts = self.tmp / "a.ts"
+        self.av_ts = self.tmp / "av.ts"
+        gop = ["-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+               "-g", "125", "-keyint_min", "125", "-sc_threshold", "0"]
+        src_v = ["-f", "lavfi", "-i", "testsrc=duration=12:size=320x180:rate=25"]
+        src_a = ["-f", "lavfi", "-i", "sine=duration=12"]
+        run = lambda args: subprocess.run([self.ffmpeg, "-y", "-v", "error", *args],
+                                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
+        run([*src_v, *gop, *common, str(self.v_ts)])
+        run([*src_a, "-c:a", "aac", *common, str(self.a_ts)])
+        run([*src_v, *src_a, *gop, "-c:a", "aac", "-shortest", *common, str(self.av_ts)])
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def assert_clip_starts_on_time(self, out: Path, expected_dur: float):
+        self.assertLess(abs(_first_video_pts_seconds(self.ffmpeg, out)), 0.1)
+        self.assertAlmostEqual(_media_duration(self.ffmpeg, out), expected_dur, delta=0.15)
+
+    def test_separate_av_mux_keeps_video_from_offset(self):
+        out = self.tmp / "out.mp4"
+        self.assertTrue(mux_trim_hls_av(self.ffmpeg, self.v_ts, 1.39, self.a_ts, 1.39, 6.0, out))
+        self.assert_clip_starts_on_time(out, 6.0)
+
+    def test_separate_av_mux_with_blur_crop(self):
+        out = self.tmp / "out_blur.mp4"
+        self.assertTrue(mux_trim_hls_av(self.ffmpeg, self.v_ts, 1.39, self.a_ts, 1.39, 6.0, out,
+                                        crop_config=CropConfig(mode="9:16_blur")))
+        self.assert_clip_starts_on_time(out, 6.0)
+        self.assertEqual(get_video_dimensions(out), (100, 180))
+
+    def test_trim_clip_ffmpeg_on_muxed_ts(self):
+        for crop in (None, CropConfig(mode="9:16")):
+            out = self.tmp / f"out_muxed_{crop.mode if crop else 'none'}.mp4".replace(":", "x")
+            trim_clip_ffmpeg(self.av_ts, out, 1.39, 7.39, crop_config=crop)
+            self.assert_clip_starts_on_time(out, 6.0)
 
 
 class TestMoviePyFallback(unittest.TestCase):
