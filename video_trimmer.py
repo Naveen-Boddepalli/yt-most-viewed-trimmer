@@ -1,5 +1,6 @@
 """Video downloading, timestamp trimming, and aspect-ratio/custom cropping module."""
 
+import contextvars
 import http.client
 import http.server
 import os
@@ -44,6 +45,95 @@ from utils import (
 sanitize_environment()
 # Enable Node.js and Deno JS runtimes for yt-dlp 2025/2026 signature/n-challenge solving
 os.environ.setdefault("YTDLP_JS_RUNTIMES", "node,deno")
+
+
+# ------------------------------------------------------------------------------
+# Download Failure Diagnostics
+# ------------------------------------------------------------------------------
+# Every download tier tries several clients and swallows their errors so the next
+# one can run. Without this, the user only ever saw the last client's message
+# (often a misleading "Requested format is not available") and the cloud logs
+# showed nothing about why yt-dlp failed.
+_FAILURES: "contextvars.ContextVar[Optional[List[str]]]" = contextvars.ContextVar("_FAILURES", default=None)
+
+# Phrases yt-dlp / pytubefix produce when YouTube refuses to serve this IP or
+# account, as opposed to a local problem (FFmpeg, disk, a bad timestamp).
+_BLOCK_MARKERS = (
+    "not a bot",
+    "sign in to confirm",
+    "page needs to be reloaded",
+    "requested format is not available",
+    "only images are available",
+    "po token",
+    "po_token",
+    "http error 403",
+    "403: forbidden",
+    "login_required",
+    "content isn't available",
+    "this video is unavailable",
+    "bot detection",
+)
+
+
+class YouTubeBlockedError(RuntimeError):
+    """Every download route failed and YouTube's responses point to a bot/IP block."""
+
+    def __init__(self, message: str, reasons: List[str]):
+        super().__init__(message)
+        self.reasons = reasons
+
+
+def _looks_blocked(text: str) -> bool:
+    low = text.lower()
+    return any(m in low for m in _BLOCK_MARKERS)
+
+
+def _record_failure(stage: str, exc: Any = None, logger: Any = None) -> None:
+    """Note why one download attempt failed, for the UI and the server log."""
+    parts: List[str] = []
+    if exc is not None:
+        parts.append(strip_ansi(str(exc)).strip())
+    if logger is not None:
+        for msg in list(getattr(logger, "errors", []))[-2:] + list(getattr(logger, "warnings", []))[-2:]:
+            msg = strip_ansi(str(msg)).strip()
+            if msg and msg not in parts:
+                parts.append(msg)
+    detail = " | ".join(p for p in parts if p) or "no usable formats returned"
+    detail = re.sub(r"\s+", " ", detail)[:400]
+    line = f"{stage}: {detail}"
+    print(f"[yt-trimmer] {line}", file=sys.stderr, flush=True)
+    bucket = _FAILURES.get()
+    if bucket is not None:
+        bucket.append(line)
+
+
+def _collect_failures(fn: Callable[..., Any]) -> Callable[..., Any]:
+    """Give a top-level download call its own list of failed attempts."""
+    import functools
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        if _FAILURES.get() is not None:
+            return fn(*args, **kwargs)
+        token = _FAILURES.set([])
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _FAILURES.reset(token)
+
+    return wrapper
+
+
+def _raise_download_failure(what: str, failures: List[str], last_exc: Optional[Exception]) -> None:
+    """Raise the most useful error once every route has failed."""
+    if any(_looks_blocked(f) for f in failures):
+        raise YouTubeBlockedError(
+            f"YouTube refused to serve {what} to this server ({len(failures)} download attempts were blocked).",
+            failures,
+        )
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"Could not download {what}." + (f" Last error: {failures[-1]}" if failures else ""))
 
 
 # ------------------------------------------------------------------------------
@@ -981,10 +1071,12 @@ def _try_python_hls_direct_slice(
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 if not info or not isinstance(info.get("formats"), list):
+                    _record_failure(f"HLS slice ({prof['name']})", logger=ydl_opts.get("logger"))
                     continue
 
                 muxed_fmt, v_fmt, a_fmt = _select_hls_formats(info["formats"], max_height)
                 if not muxed_fmt and not (v_fmt and a_fmt and ffmpeg_exe):
+                    _record_failure(f"HLS slice ({prof['name']})", "no HLS formats", ydl_opts.get("logger"))
                     continue
                 if not _wait_for_available_at([muxed_fmt, v_fmt, a_fmt], progress_callback=progress_callback):
                     continue
@@ -1072,7 +1164,8 @@ def _try_python_hls_direct_slice(
                                     tmp_f.unlink()
                             except Exception:
                                 pass
-        except Exception:
+        except Exception as exc:
+            _record_failure(f"HLS slice ({prof['name']})", exc, ydl_opts.get("logger"))
             continue
 
     return None
@@ -1371,6 +1464,7 @@ def _try_python_http_range_slice(
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
                 if not info or not isinstance(info.get("formats"), list):
+                    _record_failure(f"HTTP range ({prof['name']})", logger=ydl_opts.get("logger"))
                     continue
 
                 prog_fmt, v_fmt, a_fmt = _select_https_formats(info["formats"], max_height)
@@ -1386,6 +1480,7 @@ def _try_python_http_range_slice(
                         "/a": (a_fmt["url"], a_fmt.get("http_headers") or info.get("http_headers") or {}),
                     }
                 else:
+                    _record_failure(f"HTTP range ({prof['name']})", "no HTTPS formats", ydl_opts.get("logger"))
                     continue
 
                 if not _wait_for_available_at(chosen_list, progress_callback=progress_callback):
@@ -1414,7 +1509,8 @@ def _try_python_http_range_slice(
                     crop_config=crop_config,
                     progress_callback=progress_callback,
                 )
-        except Exception:
+        except Exception as exc:
+            _record_failure(f"HTTP range ({prof['name']})", exc, ydl_opts.get("logger"))
             continue
 
     return None
@@ -1515,7 +1611,9 @@ def _download_with_pytubefix(
                                 pass
                         if final_mp4.exists() and final_mp4.stat().st_size > 0:
                             return final_mp4
-            except Exception:
+                _record_failure(f"pytubefix ({client_name})", "no downloadable streams")
+            except Exception as exc:
+                _record_failure(f"pytubefix ({client_name})", exc)
                 continue
 
     return None
@@ -1587,6 +1685,7 @@ def _build_ydl_base_opts(
     return opts
 
 
+@_collect_failures
 def download_full_video(
     url: str,
     output_dir: Path,
@@ -1651,6 +1750,7 @@ def download_full_video(
                     return f
         except Exception as exc:
             last_exc = exc
+            _record_failure(f"Full download ({prof['name']})", exc, ydl_opts.get("logger"))
             continue
 
     pytube_res = _download_with_pytubefix(
@@ -1662,11 +1762,11 @@ def download_full_video(
     if pytube_res and pytube_res.exists() and pytube_res.stat().st_size > 0:
         return pytube_res
 
-    if last_exc:
-        raise last_exc
-    raise FileNotFoundError("Downloaded video file could not be found in output directory.")
+    _raise_download_failure("the video", _FAILURES.get() or [], last_exc)
+    raise AssertionError("unreachable")
 
 
+@_collect_failures
 def download_single_clip_section(
     url: str,
     output_path: Path,
@@ -1824,6 +1924,7 @@ def download_single_clip_section(
                     return output_path
         except Exception as exc:
             last_exc = exc
+            _record_failure(f"Section download ({prof['name']})", exc, ydl_opts.get("logger"))
             continue
 
     # Tier 4: pytubefix fallback + local FFmpeg trim/crop
@@ -1846,12 +1947,12 @@ def download_single_clip_section(
                 )
                 if output_path.exists() and output_path.stat().st_size > 0:
                     return output_path
-    except Exception:
-        pass
+    except Exception as exc:
+        _record_failure("pytubefix trim", exc)
 
-    if last_exc:
-        raise last_exc
-    raise FileNotFoundError(f"Failed to produce stream-trimmed clip: {output_path.name}")
+    clip_range = f"{format_timestamp(start_time)}-{format_timestamp(end_time)}"
+    _raise_download_failure(f"this clip ({clip_range})", _FAILURES.get() or [], last_exc)
+    raise AssertionError("unreachable")
 
 
 def download_and_trim_segments_direct(

@@ -655,6 +655,61 @@ class TestHlsTsSeekAccuracy(unittest.TestCase):
             self.assert_clip_starts_on_time(out, 6.0)
 
 
+class TestDownloadFailureReporting(unittest.TestCase):
+    """When every route fails, the user should learn *why* (e.g. YouTube's bot check on a
+    cloud IP), not just the last client's "Requested format is not available"."""
+
+    def _run_clip_download(self, reason: str):
+        from unittest import mock
+        import video_trimmer as vt
+
+        def failing_tier(**kwargs):
+            vt._record_failure("HLS slice (visionos)", reason)
+            return None
+
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(vt, "_try_python_hls_direct_slice", side_effect=failing_tier), \
+                mock.patch.object(vt, "_try_python_http_range_slice", side_effect=failing_tier), \
+                mock.patch.object(vt, "_build_client_profiles", return_value=[]), \
+                mock.patch.object(vt, "_download_with_pytubefix", return_value=None):
+            vt.download_single_clip_section(
+                url="https://youtu.be/bVbXU7fq0ak", output_path=Path(tmp) / "c.mp4",
+                start_time=10.0, end_time=20.0,
+            )
+
+    def test_bot_check_raises_blocked_error_with_every_reason(self):
+        import video_trimmer as vt
+        with self.assertRaises(vt.YouTubeBlockedError) as ctx:
+            self._run_clip_download("ERROR: [youtube] x: Sign in to confirm you're not a bot")
+        self.assertEqual(len(ctx.exception.reasons), 2)
+        self.assertTrue(all("not a bot" in r for r in ctx.exception.reasons))
+        # A fresh call starts with an empty list instead of piling onto the last one
+        self.assertIsNone(vt._FAILURES.get())
+
+    def test_requested_format_unavailable_counts_as_blocked(self):
+        import video_trimmer as vt
+        with self.assertRaises(vt.YouTubeBlockedError):
+            self._run_clip_download("ERROR: [youtube] x: Requested format is not available")
+
+    def test_local_failure_is_not_reported_as_a_block(self):
+        import video_trimmer as vt
+        with self.assertRaises(RuntimeError) as ctx:
+            self._run_clip_download("ffmpeg exited with code 1")
+        self.assertNotIsInstance(ctx.exception, vt.YouTubeBlockedError)
+        self.assertIn("ffmpeg exited", str(ctx.exception))
+
+    def test_record_failure_includes_captured_ytdlp_warnings(self):
+        import video_trimmer as vt
+        log = utils.YdlCaptureLogger()
+        log.warning("[youtube] x: The page needs to be reloaded.")
+        token = vt._FAILURES.set([])
+        try:
+            vt._record_failure("Section download (tv)", None, log)
+            self.assertIn("page needs to be reloaded", vt._FAILURES.get()[0])
+        finally:
+            vt._FAILURES.reset(token)
+
+
 class TestMoviePyFallback(unittest.TestCase):
     def test_vertical_blur_survives_moviepy_fallback(self):
         if not has_ffmpeg():
