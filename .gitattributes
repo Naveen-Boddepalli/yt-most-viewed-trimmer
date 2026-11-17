@@ -1,0 +1,5 @@
+# Windows batch files break (labels, goto) with Unix line endings, and the
+# macOS/Linux launchers break with Windows ones.
+*.bat     text eol=crlf
+*.command text eol=lf
+*.sh      text eol=lf

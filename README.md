@@ -4,6 +4,22 @@ A Python + Streamlit web application that loads a YouTube video from its link, e
 
 ---
 
+## ▶️ Run It on Your Own Computer (No Setup)
+
+YouTube blocks most cloud servers, so this app works best on your own computer. You don't need to install anything first:
+
+| Computer | Start the app |
+| --- | --- |
+| macOS | Double-click `Start-Mac.command` |
+| Windows | Double-click `Start-Windows.bat` |
+| Linux | `bash start-linux.sh` |
+
+The first start downloads [uv](https://docs.astral.sh/uv/) (no admin rights needed), a private copy of Python 3.12 and the libraries into `.venv/` in this folder, which takes a few minutes. Later starts take seconds and update `yt-dlp` each time, since old versions stop working with YouTube. The app opens in your browser, listens only on `127.0.0.1`, and runs in single-user mode (pasted cookies are kept between starts).
+
+**Sharing it with someone:** send them a zip from GitHub (**Code → Download ZIP**) or `git archive -o yt-trimmer.zip HEAD`. Don't zip your working folder: it holds your `user_cookies.txt` (your YouTube login) and the large `.venv/`. They can follow `HOW-TO-START.txt`.
+
+---
+
 ## ⚡ Direct Stream-Trim (Cloud Optimized)
 - **Zero Full-Video Download Required**: Directly streams and slices *only* the requested 30–60s highlight clip from YouTube's CDN using byte-range requests.
 - **Ultra-lightweight**: Downloads only **10–15 MB** per clip instead of 1–2 GB source videos.
