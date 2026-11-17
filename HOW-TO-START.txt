@@ -1,0 +1,39 @@
+YouTube Highlight Trimmer: how to start it
+==========================================
+
+You don't need to install anything first. You need an internet connection.
+
+1. Unzip the folder somewhere you'll keep it (for example, Documents).
+
+2. Start the app:
+
+   Mac:      double-click  Start-Mac.command
+   Windows:  double-click  Start-Windows.bat
+
+3. A black window opens. The FIRST time, it sets itself up, which takes a
+   few minutes. After that it starts in a few seconds.
+
+4. The app opens in your web browser. Paste a YouTube link and click Analyze.
+
+Keep the black window open while you use the app. Close it when you're done.
+
+
+If your computer blocks the file
+--------------------------------
+
+Mac ("cannot be opened" or "Apple could not verify"):
+  Open System Settings > Privacy & Security, scroll down, and click
+  "Open Anyway" next to Start-Mac.command. You only need to do this once.
+
+  Or: open the Terminal app, type  bash  followed by a space, drag
+  Start-Mac.command into the Terminal window, and press Enter.
+
+Windows ("Windows protected your PC"):
+  Click "More info", then "Run anyway". You only need to do this once.
+
+
+If the browser doesn't open
+---------------------------
+
+Look in the black window for a line like  URL: http://127.0.0.1:8501
+and open that address in your browser.
